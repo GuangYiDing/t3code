@@ -155,6 +155,10 @@ export async function reopenClosedView(
         if (surface.title) panels.renameDevice(ref, surface.id, surface.title);
       } else panels.open(ref, "device");
       break;
+    case "host-window":
+      if (surface.target) panels.openHostWindow(ref, surface.target);
+      else panels.open(ref, "host-window");
+      break;
     case "pull-request":
       panels.openPullRequest(ref, surface);
       break;
