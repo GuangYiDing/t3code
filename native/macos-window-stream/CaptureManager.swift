@@ -476,7 +476,9 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     config.scalesToFit = true
     config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-    config.showsCursor = true
+    // Hide the host OS cursor in the video stream so clients render a single zero-latency
+    // local cursor (native hardware cursor or virtual trackpad pointer) with synced shape.
+    config.showsCursor = false
     config.queueDepth = 2
     return config
   }

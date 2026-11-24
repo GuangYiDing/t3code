@@ -80,6 +80,15 @@ struct ScreenMetaMessage: Codable {
   let appName: String?
 }
 
+struct CursorShapeMessage: Codable {
+  let type: String
+  let dataUrl: String
+  let hotspotX: Int
+  let hotspotY: Int
+  let width: Int
+  let height: Int
+}
+
 struct InputCommand: Decodable {
   let type: String
   let action: String?

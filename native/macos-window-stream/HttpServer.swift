@@ -480,6 +480,59 @@ final class WindowStreamHttpServer {
     }
   }
 
+  private static func sampleSystemCursor() -> (hash: Int, message: CursorShapeMessage)? {
+    let snapshot: (NSImage, NSPoint)? = DispatchQueue.main.sync {
+      guard let cur = NSCursor.currentSystem else { return nil }
+      return (cur.image, cur.hotSpot)
+    }
+    guard let (img, hotSpot) = snapshot else { return nil }
+    let logicalW = min(48, max(1, Int(img.size.width.rounded())))
+    let logicalH = min(48, max(1, Int(img.size.height.rounded())))
+    var rect = CGRect(x: 0, y: 0, width: logicalW, height: logicalH)
+    guard let cg = img.cgImage(forProposedRect: &rect, context: nil, hints: nil) else {
+      return nil
+    }
+    let pngData: Data?
+    if cg.width == logicalW && cg.height == logicalH {
+      let rep = NSBitmapImageRep(cgImage: cg)
+      pngData = rep.representation(using: .png, properties: [:])
+    } else if let ctx = CGContext(
+      data: nil,
+      width: logicalW,
+      height: logicalH,
+      bitsPerComponent: 8,
+      bytesPerRow: 0,
+      space: CGColorSpaceCreateDeviceRGB(),
+      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) {
+      ctx.interpolationQuality = .high
+      ctx.draw(cg, in: CGRect(x: 0, y: 0, width: logicalW, height: logicalH))
+      if let scaled = ctx.makeImage() {
+        pngData = NSBitmapImageRep(cgImage: scaled).representation(using: .png, properties: [:])
+      } else {
+        pngData = nil
+      }
+    } else {
+      pngData = nil
+    }
+    guard let pngData, !pngData.isEmpty else { return nil }
+    let hsX = min(logicalW - 1, max(0, Int(hotSpot.x.rounded())))
+    let hsY = min(logicalH - 1, max(0, Int(hotSpot.y.rounded())))
+    var hasher = Hasher()
+    hasher.combine(pngData)
+    hasher.combine(hsX)
+    hasher.combine(hsY)
+    let msg = CursorShapeMessage(
+      type: "cursor",
+      dataUrl: "data:image/png;base64,\(pngData.base64EncodedString())",
+      hotspotX: hsX,
+      hotspotY: hsY,
+      width: logicalW,
+      height: logicalH
+    )
+    return (hasher.finalize(), msg)
+  }
+
   private func serveInputWebSocket(conn: SocketConnection, req: HttpRequest, target: CaptureTargetKey) {
     guard let key = req.headers["sec-websocket-key"] else {
       conn.sendHttpResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("Missing key".utf8))
@@ -522,12 +575,30 @@ final class WindowStreamHttpServer {
       }
     }
 
+    var lastCursorHash: Int = 0
+    var lastCursorCheckTime: CFAbsoluteTime = 0
+    let pushCursorIfChanged: (Bool) -> Void = { force in
+      let now = CFAbsoluteTimeGetCurrent()
+      if !force && (now - lastCursorCheckTime) < 0.06 { return }
+      lastCursorCheckTime = now
+      guard let sampled = Self.sampleSystemCursor() else { return }
+      if !force && sampled.hash == lastCursorHash { return }
+      lastCursorHash = sampled.hash
+      if let data = try? JSONEncoder().encode(sampled.message) {
+        _ = conn.sendWsFrame(opcode: 0x1, payload: data)
+      }
+    }
+    pushCursorIfChanged(true)
+
     let decoder = JSONDecoder()
     while let msg = conn.readWsMessage() {
       switch msg.opcode {
       case 0x1:  // Text
         if let cmd = try? decoder.decode(InputCommand.self, from: msg.payload) {
           InputInjector.shared.handle(cmd, target: target)
+          if cmd.type == "mouse" || cmd.type == "wheel" {
+            pushCursorIfChanged(false)
+          }
         }
       case 0x8:  // Close
         _ = conn.sendWsFrame(opcode: 0x8, payload: Data())

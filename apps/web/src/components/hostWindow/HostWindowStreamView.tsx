@@ -2,6 +2,7 @@ import type { DeviceHubAccess } from "@t3tools/client-runtime/device/hub-access"
 import {
   createHostWindowStreamClient,
   hostWindowModifiers,
+  type HostWindowCursorShape,
   type HostWindowInputCommand,
   type HostWindowMouseButton,
   type HostWindowScreenMeta,
@@ -197,6 +198,10 @@ export function HostWindowStreamView(props: {
   const [stats, setStats] = useState<HostWindowStreamStats | null>(null);
   const [touchDevice, setTouchDevice] = useState(() => isTouchFirstDevice());
   const [touchMode, setTouchMode] = useState<TouchControlMode>("trackpad");
+  const [lastInputKind, setLastInputKind] = useState<"mouse" | "touch">(() =>
+    isTouchFirstDevice() ? "touch" : "mouse",
+  );
+  const [hostCursor, setHostCursor] = useState<HostWindowCursorShape | null>(null);
   const [virtualCursor, setVirtualCursor] = useState<NormalizedPoint>({ x: 0.5, y: 0.5 });
   const [isTouchDragging, setIsTouchDragging] = useState(false);
   const [viewport, setViewport] = useState<ViewportTransform>(DEFAULT_VIEWPORT);
@@ -234,6 +239,7 @@ export function HostWindowStreamView(props: {
         },
         onScreen: (meta) => setScreen(meta),
         onStats: (nextStats) => setStats(nextStats),
+        onCursor: (cursor) => setHostCursor(cursor),
         onMjpegFallback: () => {
           setMjpegMode(true);
           if (mjpegRef.current) client.setMjpegImage(mjpegRef.current);
@@ -535,6 +541,10 @@ export function HostWindowStreamView(props: {
     if (!mediaEl) return;
 
     if (event.pointerType === "touch") {
+      if (lastInputKind !== "touch") {
+        setLastInputKind("touch");
+        setVirtualCursor(virtualCursorRef.current);
+      }
       const touches = activeTouchesRef.current;
       touches.set(event.pointerId, {
         id: event.pointerId,
@@ -612,12 +622,16 @@ export function HostWindowStreamView(props: {
     }
 
     // Physical mouse or stylus: always direct 1:1 native desktop input.
+    if (lastInputKind !== "mouse") {
+      setLastInputKind("mouse");
+    }
     const point = normalizedPointFromRect(
       mediaEl.getBoundingClientRect(),
       event.clientX,
       event.clientY,
     );
     if (!point) return;
+    virtualCursorRef.current = point;
     const button = mouseButtonName(event.button);
     const count = computeClickCount(event.clientX, event.clientY, button, 6, event.timeStamp);
     const modifiers = consumeEffectiveModifiers(hostWindowModifiers(event));
@@ -637,6 +651,10 @@ export function HostWindowStreamView(props: {
     if (!mediaEl) return;
 
     if (event.pointerType === "touch") {
+      if (lastInputKind !== "touch") {
+        setLastInputKind("touch");
+        setVirtualCursor(virtualCursorRef.current);
+      }
       const touches = activeTouchesRef.current;
       const tracked = touches.get(event.pointerId);
       if (!tracked) return;
@@ -841,12 +859,16 @@ export function HostWindowStreamView(props: {
     }
 
     // Physical mouse or stylus move
+    if (lastInputKind !== "mouse") {
+      setLastInputKind("mouse");
+    }
     const point = normalizedPointFromRect(
       mediaEl.getBoundingClientRect(),
       event.clientX,
       event.clientY,
     );
     if (!point) return;
+    virtualCursorRef.current = point;
     const button: HostWindowMouseButton =
       event.buttons & 1
         ? "left"
@@ -875,6 +897,10 @@ export function HostWindowStreamView(props: {
     const mediaEl = activeMediaElement();
 
     if (event.pointerType === "touch") {
+      if (lastInputKind !== "touch") {
+        setLastInputKind("touch");
+        setVirtualCursor(virtualCursorRef.current);
+      }
       const touches = activeTouchesRef.current;
       touches.delete(event.pointerId);
       const session = touchSessionRef.current;
@@ -1036,8 +1062,12 @@ export function HostWindowStreamView(props: {
         ? `${screen.width}×${screen.height}`
         : null;
 
-  const showVirtualCursor = touchDevice && touchMode === "trackpad" && status === "streaming";
+  const showVirtualCursor =
+    touchDevice && touchMode === "trackpad" && lastInputKind === "touch" && status === "streaming";
   const isZoomed = viewport.zoom > 1.01;
+  const cssCursor = hostCursor
+    ? `url("${hostCursor.dataUrl}") ${hostCursor.hotspotX} ${hostCursor.hotspotY}, default`
+    : "default";
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-background">
@@ -1217,11 +1247,12 @@ export function HostWindowStreamView(props: {
           <canvas
             ref={canvasRef}
             tabIndex={-1}
-            className="max-h-full max-w-full cursor-default rounded-sm shadow-lg outline-none select-none"
+            className="max-h-full max-w-full rounded-sm shadow-lg outline-none select-none"
             style={{
               display: mjpegMode ? "none" : "block",
               width: "auto",
               height: "auto",
+              cursor: cssCursor,
             }}
           />
 
@@ -1229,11 +1260,12 @@ export function HostWindowStreamView(props: {
             ref={mjpegRef}
             alt={props.target.title}
             draggable={false}
-            className="max-h-full max-w-full cursor-default rounded-sm shadow-lg outline-none select-none"
+            className="max-h-full max-w-full rounded-sm shadow-lg outline-none select-none"
             style={{
               display: mjpegMode ? "block" : "none",
               width: "auto",
               height: "auto",
+              cursor: cssCursor,
             }}
           />
 
@@ -1263,20 +1295,35 @@ export function HostWindowStreamView(props: {
               {isTouchDragging ? (
                 <div className="absolute -top-2.5 -left-2.5 size-6 rounded-full border-2 border-primary bg-primary/20" />
               ) : null}
-              <svg
-                width="18"
-                height="22"
-                viewBox="0 0 18 22"
-                fill="none"
-                className="drop-shadow-md"
-              >
-                <path
-                  d="M1.5 1.5L1.5 17.5L5.8 13.4L8.8 19.6L11.4 18.3L8.4 12.1L14.5 12.1L1.5 1.5Z"
-                  className="fill-background stroke-foreground"
-                  strokeWidth="1.5"
-                  strokeLinejoin="round"
+              {hostCursor ? (
+                <img
+                  src={hostCursor.dataUrl}
+                  alt=""
+                  draggable={false}
+                  width={hostCursor.width}
+                  height={hostCursor.height}
+                  className="pointer-events-none block max-w-none drop-shadow-sm"
+                  style={{
+                    marginLeft: -hostCursor.hotspotX,
+                    marginTop: -hostCursor.hotspotY,
+                  }}
                 />
-              </svg>
+              ) : (
+                <svg
+                  width="18"
+                  height="22"
+                  viewBox="0 0 18 22"
+                  fill="none"
+                  className="drop-shadow-md"
+                >
+                  <path
+                    d="M1.5 1.5L1.5 17.5L5.8 13.4L8.8 19.6L11.4 18.3L8.4 12.1L14.5 12.1L1.5 1.5Z"
+                    className="fill-background stroke-foreground"
+                    strokeWidth="1.5"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              )}
             </div>
           ) : null}
         </div>

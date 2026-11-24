@@ -20,6 +20,14 @@ export interface HostWindowStreamStats {
   readonly height: number;
 }
 
+export interface HostWindowCursorShape {
+  readonly dataUrl: string;
+  readonly hotspotX: number;
+  readonly hotspotY: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 export interface HostWindowStreamTarget {
   readonly kind: "window" | "display";
   readonly id: number;
@@ -31,6 +39,7 @@ export interface HostWindowStreamEvents {
   readonly onStatus: (status: HostWindowStreamStatus, detail?: string) => void;
   readonly onScreen?: (meta: HostWindowScreenMeta) => void;
   readonly onStats?: (stats: HostWindowStreamStats) => void;
+  readonly onCursor?: (cursor: HostWindowCursorShape) => void;
   readonly onMjpegFallback: (url: string) => void;
   readonly onCanvasVideo?: () => void;
   readonly onInputConnected?: (connected: boolean) => void;
@@ -332,6 +341,9 @@ export function createHostWindowStreamClient(
             scale?: number;
             title?: string;
             appName?: string;
+            dataUrl?: string;
+            hotspotX?: number;
+            hotspotY?: number;
           };
           if (
             parsed.type === "screen" &&
@@ -344,6 +356,19 @@ export function createHostWindowStreamClient(
               scale: parsed.scale ?? 1,
               title: parsed.title ?? null,
               appName: parsed.appName ?? null,
+            });
+          } else if (
+            parsed.type === "cursor" &&
+            typeof parsed.dataUrl === "string" &&
+            typeof parsed.width === "number" &&
+            typeof parsed.height === "number"
+          ) {
+            events.onCursor?.({
+              dataUrl: parsed.dataUrl,
+              hotspotX: parsed.hotspotX ?? 0,
+              hotspotY: parsed.hotspotY ?? 0,
+              width: parsed.width,
+              height: parsed.height,
             });
           }
         } catch {}
