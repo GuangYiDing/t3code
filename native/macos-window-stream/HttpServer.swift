@@ -395,7 +395,7 @@ final class WindowStreamHttpServer {
     var subRef: StreamSubscriber?
     let sub = StreamSubscriber(
       label: "t3.avcc.sub.\(target.description)",
-      maxPendingWrites: 12,
+      maxPendingWrites: 2,
       send: { data in conn.writeAll(data) },
       onClose: {
         if let id = subRef?.id {

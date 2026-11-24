@@ -10,6 +10,9 @@ final class InputInjector {
   private var lastFocusPid: Int32 = -1
   private var lastFocusWindowId: UInt32 = 0
   private var lastFocusTime: CFAbsoluteTime = 0
+  private var cachedBoundsTarget: CaptureTargetKey?
+  private var cachedBoundsValue: (CGRect, Int32?, String?)?
+  private var cachedBoundsTime: CFAbsoluteTime = 0
   private var heldButtons: Set<String> = []
 
   func handle(_ command: InputCommand, target: CaptureTargetKey) {
@@ -53,14 +56,32 @@ final class InputInjector {
     }
   }
 
-  private func resolveBoundsAndPid(_ target: CaptureTargetKey) -> (CGRect, Int32?, String?)? {
+  private func resolveBoundsAndPid(_ target: CaptureTargetKey, forceRefresh: Bool = false) -> (
+    CGRect, Int32?, String?
+  )? {
+    let now = CFAbsoluteTimeGetCurrent()
+    if !forceRefresh,
+      cachedBoundsTarget == target,
+      let cached = cachedBoundsValue,
+      (now - cachedBoundsTime) < 0.25
+    {
+      return cached
+    }
+    let fresh: (CGRect, Int32?, String?)?
     switch target {
     case .window(let windowId):
-      guard let info = WindowDiscovery.shared.liveWindowInfo(windowId: windowId) else { return nil }
-      return (info.bounds, info.pid, info.title)
+      if let info = WindowDiscovery.shared.liveWindowInfo(windowId: windowId) {
+        fresh = (info.bounds, info.pid, info.title)
+      } else {
+        fresh = nil
+      }
     case .display(let displayId):
-      return (WindowDiscovery.shared.liveDisplayBounds(displayId: displayId), nil, nil)
+      fresh = (WindowDiscovery.shared.liveDisplayBounds(displayId: displayId), nil, nil)
     }
+    cachedBoundsTarget = target
+    cachedBoundsValue = fresh
+    cachedBoundsTime = now
+    return fresh
   }
 
   private func screenPoint(nx: Double, ny: Double, bounds: CGRect) -> CGPoint {
@@ -74,19 +95,31 @@ final class InputInjector {
 
   private func focusTarget(_ target: CaptureTargetKey, force: Bool) {
     guard case .window(let windowId) = target else { return }
-    guard let info = WindowDiscovery.shared.liveWindowInfo(windowId: windowId) else { return }
-    let now = CFAbsoluteTimeGetCurrent()
-    if !force && lastFocusPid == info.pid && lastFocusWindowId == windowId && (now - lastFocusTime) < 0.8 {
+    guard let (bounds, pidOpt, titleOpt) = resolveBoundsAndPid(target, forceRefresh: force),
+      let pid = pidOpt
+    else {
       return
     }
-    lastFocusPid = info.pid
+    let now = CFAbsoluteTimeGetCurrent()
+    if !force {
+      if lastFocusPid == pid && lastFocusWindowId == windowId && (now - lastFocusTime) < 1.5 {
+        return
+      }
+      if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        && lastFocusWindowId == windowId
+      {
+        lastFocusTime = now
+        return
+      }
+    }
+    lastFocusPid = pid
     lastFocusWindowId = windowId
     lastFocusTime = now
 
-    if let app = NSRunningApplication(processIdentifier: info.pid) {
+    if let app = NSRunningApplication(processIdentifier: pid) {
       app.activate()
     }
-    raiseWindowViaAX(pid: info.pid, expectedBounds: info.bounds, expectedTitle: info.title)
+    raiseWindowViaAX(pid: pid, expectedBounds: bounds, expectedTitle: titleOpt ?? "")
   }
 
   private func raiseWindowViaAX(pid: Int32, expectedBounds: CGRect, expectedTitle: String) {
@@ -145,7 +178,9 @@ final class InputInjector {
 
   private func handleMouse(_ command: InputCommand, target: CaptureTargetKey) {
     guard let nx = command.x, let ny = command.y, let action = command.action else { return }
-    guard let (bounds, _, _) = resolveBoundsAndPid(target) else { return }
+    guard let (bounds, _, _) = resolveBoundsAndPid(target, forceRefresh: action == "down") else {
+      return
+    }
     let pt = screenPoint(nx: nx, ny: ny, bounds: bounds)
     let buttonName = command.button ?? "left"
     let flags = cgEventFlags(from: command.modifiers ?? 0)

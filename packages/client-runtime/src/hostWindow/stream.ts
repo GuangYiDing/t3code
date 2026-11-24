@@ -78,7 +78,7 @@ export interface HostWindowStreamClient {
 const RETRY_DELAY_MS = 1_200;
 const FIRST_FRAME_TIMEOUT_MS = 10_000;
 const FRAME_DURATION_US = 16_667;
-const SOFT_DECODE_QUEUE = 8;
+const SOFT_DECODE_QUEUE = 2;
 
 const isWebCodecsSupported = (): boolean =>
   typeof globalThis !== "undefined" &&
@@ -203,6 +203,7 @@ export function createHostWindowStreamClient(
       codec: avcCodecString(description),
       description,
       optimizeForLatency: true,
+      hardwareAcceleration: "prefer-hardware",
     };
     const support = await VideoDecoder.isConfigSupported(config).catch(() => ({
       supported: false,

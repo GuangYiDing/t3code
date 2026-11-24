@@ -36,7 +36,8 @@ final class H264Encoder {
 
     var created: VTCompressionSession?
     let encoderSpec: [CFString: Any] = [
-      kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanTrue!
+      kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: kCFBooleanTrue!,
+      kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue!,
     ]
     let status = VTCompressionSessionCreate(
       allocator: kCFAllocatorDefault,
@@ -57,13 +58,18 @@ final class H264Encoder {
 
     // Scale bitrate proportionally to pixel area (3 Mbps .. 12 Mbps).
     let pixels = Double(evenW) * Double(evenH)
-    let bitrate = Int32(max(3_000_000, min(12_000_000, pixels * 3.5)))
+    let bitrate = Int32(max(3_000_000, min(12_000_000, pixels * 4.0)))
 
     VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
     VTSessionSetProperty(
       session,
       key: kVTCompressionPropertyKey_AllowFrameReordering,
       value: kCFBooleanFalse
+    )
+    VTSessionSetProperty(
+      session,
+      key: kVTCompressionPropertyKey_MaxFrameDelayCount,
+      value: NSNumber(value: 1)
     )
     VTSessionSetProperty(
       session,

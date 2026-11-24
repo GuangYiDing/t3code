@@ -233,7 +233,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
       filter = SCContentFilter(desktopIndependentWindow: window)
       pointW = max(1, Int(window.frame.width.rounded()))
       pointH = max(1, Int(window.frame.height.rounded()))
-      scale = 2.0
+      scale = Self.displayScaleForRect(window.frame)
       title = window.title
       appName = window.owningApplication?.applicationName
     case .display(let displayId):
@@ -450,6 +450,15 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     for s in subs { s.enqueue(endPacket, droppable: false) }
   }
 
+  private static func displayScaleForRect(_ rect: CGRect) -> Double {
+    var displayCount: UInt32 = 0
+    var displays = [CGDirectDisplayID](repeating: 0, count: 4)
+    if CGGetDisplaysWithRect(rect, 4, &displays, &displayCount) == .success, displayCount > 0 {
+      return WindowDiscovery.shared.displayScaleFactor(displays[0])
+    }
+    return WindowDiscovery.shared.displayScaleFactor(CGMainDisplayID())
+  }
+
   private static func targetPixelDimensions(pointW: Int, pointH: Int, scale: Double) -> (Int, Int) {
     let rawW = Double(pointW) * scale
     let rawH = Double(pointH) * scale
@@ -464,10 +473,11 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     let config = SCStreamConfiguration()
     config.width = width
     config.height = height
+    config.scalesToFit = true
     config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     config.showsCursor = true
-    config.queueDepth = 3
+    config.queueDepth = 2
     return config
   }
 

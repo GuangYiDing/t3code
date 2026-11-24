@@ -42,6 +42,16 @@ export function HostWindowStreamView(props: {
     button: HostWindowMouseButton;
   }>({ ts: 0, x: 0, y: 0, count: 0, button: "left" });
   const composingRef = useRef(false);
+  const pendingMoveRef = useRef<HostWindowInputCommand | null>(null);
+  const moveRafRef = useRef<number | null>(null);
+  const pendingWheelRef = useRef<{
+    x: number;
+    y: number;
+    deltaX: number;
+    deltaY: number;
+    modifiers: number;
+  } | null>(null);
+  const wheelRafRef = useRef<number | null>(null);
 
   const [status, setStatus] = useState<HostWindowStreamStatus>("connecting");
   const [statusDetail, setStatusDetail] = useState<string | null>(null);
@@ -86,6 +96,12 @@ export function HostWindowStreamView(props: {
     client.start();
 
     return () => {
+      if (moveRafRef.current !== null) cancelAnimationFrame(moveRafRef.current);
+      if (wheelRafRef.current !== null) cancelAnimationFrame(wheelRafRef.current);
+      moveRafRef.current = null;
+      wheelRafRef.current = null;
+      pendingMoveRef.current = null;
+      pendingWheelRef.current = null;
       client.stop();
       if (clientRef.current === client) clientRef.current = null;
     };
@@ -149,14 +165,22 @@ export function HostWindowStreamView(props: {
           : event.buttons & 4
             ? "middle"
             : "none";
-    sendInput({
+    pendingMoveRef.current = {
       type: "mouse",
       action: "move",
       x: point.x,
       y: point.y,
       button,
       modifiers: hostWindowModifiers(event),
-    });
+    };
+    if (moveRafRef.current === null) {
+      moveRafRef.current = requestAnimationFrame(() => {
+        moveRafRef.current = null;
+        const cmd = pendingMoveRef.current;
+        pendingMoveRef.current = null;
+        if (cmd) sendInput(cmd);
+      });
+    }
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLElement>) => {
@@ -176,14 +200,22 @@ export function HostWindowStreamView(props: {
   const handleWheel = (event: React.WheelEvent<HTMLElement>) => {
     const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
     if (!point) return;
-    sendInput({
-      type: "wheel",
+    const prev = pendingWheelRef.current;
+    pendingWheelRef.current = {
       x: point.x,
       y: point.y,
-      deltaX: event.deltaX,
-      deltaY: event.deltaY,
+      deltaX: (prev?.deltaX ?? 0) + event.deltaX,
+      deltaY: (prev?.deltaY ?? 0) + event.deltaY,
       modifiers: hostWindowModifiers(event),
-    });
+    };
+    if (wheelRafRef.current === null) {
+      wheelRafRef.current = requestAnimationFrame(() => {
+        wheelRafRef.current = null;
+        const wheel = pendingWheelRef.current;
+        pendingWheelRef.current = null;
+        if (wheel) sendInput({ type: "wheel", ...wheel });
+      });
+    }
   };
 
   const sendShortcut = (code: string, modifiers: number) => {
@@ -293,7 +325,7 @@ export function HostWindowStreamView(props: {
         </div>
       </div>
 
-      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/90 p-2">
+      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/95 p-1">
         {status !== "streaming" ? (
           <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background/80 text-xs text-muted-foreground">
             {status === "connecting" ? <Spinner className="size-4" /> : null}
@@ -309,8 +341,13 @@ export function HostWindowStreamView(props: {
         <canvas
           ref={canvasRef}
           tabIndex={0}
-          className="max-h-full max-w-full cursor-default rounded-md object-contain shadow-lg outline-none select-none"
-          style={{ display: mjpegMode ? "none" : "block", touchAction: "none" }}
+          className="max-h-full max-w-full cursor-default rounded-sm shadow-lg outline-none select-none"
+          style={{
+            display: mjpegMode ? "none" : "block",
+            width: "auto",
+            height: "auto",
+            touchAction: "none",
+          }}
           onContextMenu={(event) => event.preventDefault()}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
@@ -323,8 +360,13 @@ export function HostWindowStreamView(props: {
           ref={mjpegRef}
           alt={props.target.title}
           draggable={false}
-          className="max-h-full max-w-full cursor-default rounded-md object-contain shadow-lg outline-none select-none"
-          style={{ display: mjpegMode ? "block" : "none", touchAction: "none" }}
+          className="max-h-full max-w-full cursor-default rounded-sm shadow-lg outline-none select-none"
+          style={{
+            display: mjpegMode ? "block" : "none",
+            width: "auto",
+            height: "auto",
+            touchAction: "none",
+          }}
           onContextMenu={(event) => event.preventDefault()}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
