@@ -89,6 +89,81 @@ struct CursorShapeMessage: Codable {
   let height: Int
 }
 
+enum StreamQualityPreset: String, Codable {
+  case speed
+  case balanced
+  case crisp
+
+  var maxSide: Double {
+    switch self {
+    case .speed: return 1280.0
+    case .balanced: return 1920.0
+    case .crisp: return 2560.0
+    }
+  }
+
+  var targetFps: Int32 {
+    switch self {
+    case .speed: return 30
+    case .balanced: return 60
+    case .crisp: return 60
+    }
+  }
+
+  func targetBitrate(pixels: Double) -> Int32 {
+    switch self {
+    case .speed:
+      return Int32(max(1_500_000, min(3_500_000, pixels * 2.0)))
+    case .balanced:
+      return Int32(max(3_000_000, min(8_000_000, pixels * 3.8)))
+    case .crisp:
+      return Int32(max(6_000_000, min(16_000_000, pixels * 6.5)))
+    }
+  }
+
+  var useHighProfile: Bool {
+    self == .crisp
+  }
+}
+
+struct AudioMetaMessage: Codable {
+  let type: String
+  let sampleRate: Int
+  let channels: Int
+  let format: String
+}
+
+struct ClipboardSyncMessage: Codable {
+  let type: String
+  let text: String
+}
+
+struct VirtualDisplayCreateRequest: Decodable {
+  let width: Int
+  let height: Int
+  let hiDPI: Bool?
+  let name: String?
+}
+
+struct VirtualDisplaySummary: Codable {
+  let id: UInt32
+  let name: String
+  let width: Int
+  let height: Int
+  let scale: Double
+}
+
+struct UploadFileResponse: Codable {
+  let ok: Bool
+  let filename: String
+  let bytes: Int
+  let path: String
+}
+
+struct BitrateUpdateRequest: Decodable {
+  let bps: Int32
+}
+
 struct InputCommand: Decodable {
   let type: String
   let action: String?
@@ -103,4 +178,7 @@ struct InputCommand: Decodable {
   let modifiers: Int?
   let text: String?
   let paste: Bool?
+  let width: Int?
+  let height: Int?
+  let preset: String?
 }

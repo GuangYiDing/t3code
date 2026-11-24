@@ -1,13 +1,20 @@
+import {
+  createHostVirtualDisplay,
+  deleteHostVirtualDisplay,
+  type HostWindowVirtualDisplay,
+} from "@t3tools/client-runtime/host-window/stream";
 import type { HostWindowListResult, ScopedThreadRef } from "@t3tools/contracts";
 import { T, useGT, Var } from "gt-react";
 import {
   AlertCircle,
   CheckCircle2,
   Monitor,
+  Plus,
   RefreshCw,
   Search,
   Settings,
   ShieldAlert,
+  Trash2,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 
@@ -40,9 +47,55 @@ export function HostWindowPanel(props: {
 
   const [catalog, setCatalog] = useState<HostWindowListResult | null>(null);
   const [loading, setLoading] = useState(false);
+  const [creatingDisplay, setCreatingDisplay] = useState(false);
+  const [managedVirtualIds, setManagedVirtualIds] = useState<ReadonlyArray<number>>([]);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [picking, setPicking] = useState(!props.surface.target);
+
+  const handleCreateVirtualDisplay = async () => {
+    if (!access || creatingDisplay) return;
+    setCreatingDisplay(true);
+    setError(null);
+    try {
+      const vw = typeof window !== "undefined" ? Math.round(window.innerWidth) : 1280;
+      const vh = typeof window !== "undefined" ? Math.round(window.innerHeight) : 800;
+      const ratio = vw > 0 && vh > 0 ? vw / vh : 1.6;
+      const targetW = Math.min(1920, Math.max(1024, Math.round(vw * 1.4)));
+      const targetH = Math.min(1440, Math.max(720, Math.round(targetW / ratio)));
+      const created: HostWindowVirtualDisplay = await createHostVirtualDisplay(access, {
+        width: targetW & ~1,
+        height: targetH & ~1,
+        hiDPI: true,
+        name: "T3 Virtual Display",
+      });
+      setManagedVirtualIds((prev) => (prev.includes(created.id) ? prev : [...prev, created.id]));
+      setTimeout(() => {
+        void refresh();
+      }, 450);
+      selectTarget({
+        kind: "display",
+        id: created.id,
+        appName: created.name,
+        title: `${created.width}×${created.height}`,
+      });
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : gt("Could not create virtual display."));
+    } finally {
+      setCreatingDisplay(false);
+    }
+  };
+
+  const handleDeleteVirtualDisplay = async (displayId: number) => {
+    if (!access) return;
+    const removed = await deleteHostVirtualDisplay(access, displayId).catch(() => false);
+    if (removed) {
+      setManagedVirtualIds((prev) => prev.filter((id) => id !== displayId));
+      setTimeout(() => {
+        void refresh();
+      }, 350);
+    }
+  };
 
   const refresh = async () => {
     setLoading(true);
@@ -272,46 +325,76 @@ export function HostWindowPanel(props: {
                     )}
                   </div>
 
-                  {(catalog?.displays.length ?? 0) > 0 ? (
-                    <div>
-                      <div className="px-2 pb-1 text-3xs font-semibold tracking-wider text-muted-foreground uppercase">
+                  <div>
+                    <div className="flex items-center justify-between px-2 pb-1">
+                      <span className="text-3xs font-semibold tracking-wider text-muted-foreground uppercase">
                         <T>
                           Displays &amp; Virtual Screens (<Var>{catalog?.displays.length ?? 0}</Var>
                           )
                         </T>
-                      </div>
-                      <div className="flex flex-col gap-0.5">
-                        {catalog?.displays.map((display) => (
-                          <button
-                            key={display.id}
-                            type="button"
-                            onClick={() =>
-                              selectTarget({
-                                kind: "display",
-                                id: display.id,
-                                appName: display.isMain ? gt("Main Display") : gt("Display"),
-                                title: `#${display.id}`,
-                              })
-                            }
-                            className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
-                          >
-                            <Monitor className="size-4 shrink-0 text-muted-foreground" />
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate text-xs font-medium">
-                                {display.isMain
-                                  ? gt("Main Display")
-                                  : gt("Extended / Virtual Display")}{" "}
-                                #{display.id}
-                              </div>
-                              <div className="truncate text-2xs text-muted-foreground">
-                                {display.width}×{display.height} @{display.scale}x
-                              </div>
-                            </div>
-                          </button>
-                        ))}
-                      </div>
+                      </span>
+                      {access ? (
+                        <Button
+                          size="xs"
+                          variant="ghost"
+                          disabled={creatingDisplay}
+                          title={gt("Create a virtual display matching this screen ratio")}
+                          onClick={() => void handleCreateVirtualDisplay()}
+                        >
+                          <Plus className="mr-1 size-3" />
+                          <span className="text-2xs">
+                            {creatingDisplay ? <T>Creating…</T> : <T>New virtual display</T>}
+                          </span>
+                        </Button>
+                      ) : null}
                     </div>
-                  ) : null}
+                    <div className="flex flex-col gap-0.5">
+                      {catalog?.displays.map((display) => {
+                        const isManaged = managedVirtualIds.includes(display.id);
+                        return (
+                          <div key={display.id} className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                selectTarget({
+                                  kind: "display",
+                                  id: display.id,
+                                  appName: display.isMain ? gt("Main Display") : gt("Display"),
+                                  title: `#${display.id}`,
+                                })
+                              }
+                              className="flex min-w-0 flex-1 items-center gap-2.5 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                            >
+                              <Monitor className="size-4 shrink-0 text-muted-foreground" />
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-xs font-medium">
+                                  {display.isMain
+                                    ? gt("Main Display")
+                                    : isManaged
+                                      ? gt("T3 Virtual Display")
+                                      : gt("Extended / Virtual Display")}{" "}
+                                  #{display.id}
+                                </div>
+                                <div className="truncate text-2xs text-muted-foreground">
+                                  {display.width}×{display.height} @{display.scale}x
+                                </div>
+                              </div>
+                            </button>
+                            {isManaged ? (
+                              <Button
+                                size="xs"
+                                variant="ghost"
+                                title={gt("Remove virtual display")}
+                                onClick={() => void handleDeleteVirtualDisplay(display.id)}
+                              >
+                                <Trash2 className="size-3 text-muted-foreground" />
+                              </Button>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
                 </div>
               )}
             </div>

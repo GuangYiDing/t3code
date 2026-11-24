@@ -45,47 +45,55 @@ const decodeHelperWindows = Schema.decodeUnknownSync(HelperWindowsResponse);
 const decodePermissions = Schema.decodeUnknownSync(HostWindowPermissions);
 const isHostWindowOperationError = Schema.is(HostWindowOperationError);
 
-function resolveHelperBinaryPath(): string | null {
-  // oxlint-disable-next-line t3code/no-global-process-runtime -- Native helper resolution inspects host platform, arch, and override env.
-  if (process.platform !== "darwin") return null;
+interface PlatformHelperDescriptor {
+  readonly dir: string;
+  readonly binary: string;
+}
 
+function platformHelperDescriptor(): PlatformHelperDescriptor | null {
+  // oxlint-disable-next-line t3code/no-global-process-runtime -- Native helper resolution inspects host platform.
+  switch (process.platform) {
+    case "darwin":
+      return { dir: "macos-window-stream", binary: "t3-macos-window-stream" };
+    case "win32":
+      return { dir: "windows-window-stream", binary: "t3-windows-window-stream.exe" };
+    case "linux":
+      return { dir: "linux-window-stream", binary: "t3-linux-window-stream" };
+    default:
+      return null;
+  }
+}
+
+function resolveHelperBinaryPath(): string | null {
+  // Allow an explicit cross-platform helper override on any OS (darwin, win32, linux).
   const explicit = process.env.T3CODE_HOST_WINDOW_HELPER_PATH?.trim();
   if (explicit && NodeFS.existsSync(explicit)) return explicit;
+
+  const descriptor = platformHelperDescriptor();
+  if (!descriptor) return null;
 
   // oxlint-disable-next-line t3code/no-global-process-runtime -- Match host CPU slice for local dev builds.
   const arch = process.arch === "x64" ? "x64" : "arm64";
   const here = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
   const candidates = [
     // Running from source: apps/server/src/hostWindow/HostWindowService.ts
+    NodePath.resolve(here, "../../../../native", descriptor.dir, "build", arch, descriptor.binary),
     NodePath.resolve(
       here,
-      "../../../../native/macos-window-stream/build",
-      arch,
-      "t3-macos-window-stream",
-    ),
-    NodePath.resolve(
-      here,
-      "../../../../native/macos-window-stream/build/universal/t3-macos-window-stream",
+      "../../../../native",
+      descriptor.dir,
+      "build/universal",
+      descriptor.binary,
     ),
     // Running from built server bundle: apps/server/dist/*
-    NodePath.resolve(
-      here,
-      "../../../native/macos-window-stream/build",
-      arch,
-      "t3-macos-window-stream",
-    ),
-    NodePath.resolve(
-      here,
-      "../../../native/macos-window-stream/build/universal/t3-macos-window-stream",
-    ),
+    NodePath.resolve(here, "../../../native", descriptor.dir, "build", arch, descriptor.binary),
+    NodePath.resolve(here, "../../../native", descriptor.dir, "build/universal", descriptor.binary),
   ];
 
   // Electron packaged resources path when bundled inside desktop app.
   const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
   if (resourcesPath) {
-    candidates.unshift(
-      NodePath.join(resourcesPath, "macos-window-stream", "t3-macos-window-stream"),
-    );
+    candidates.unshift(NodePath.join(resourcesPath, descriptor.dir, descriptor.binary));
   }
 
   for (const candidate of candidates) {
@@ -201,22 +209,18 @@ export const layer = Layer.effect(
     yield* Effect.addFinalizer(() => stopHelper);
 
     const ensureRunning = Effect.fn("HostWindowService.ensureRunning")(function* () {
-      // oxlint-disable-next-line t3code/no-global-process-runtime -- Native window streaming is macOS-only in this release.
-      if (process.platform !== "darwin") {
-        return yield* new HostWindowUnavailableError({
-          reason: "Host application streaming is currently supported on macOS environments only.",
-        });
-      }
-
       if (running && running.child.exitCode === null && !running.child.killed) {
         return running.endpoint;
       }
 
       const binaryPath = resolveHelperBinaryPath();
       if (!binaryPath) {
+        // oxlint-disable-next-line t3code/no-global-process-runtime -- Report platform-specific setup guidance.
+        const isMac = process.platform === "darwin";
         return yield* new HostWindowUnavailableError({
-          reason:
-            "macOS window stream helper binary is not built yet. Run `node native/macos-window-stream/build.mjs` on the host.",
+          reason: isMac
+            ? "macOS window stream helper binary is not built yet. Run `node native/macos-window-stream/build.mjs` on the host."
+            : "No host window stream helper is installed for this platform. Set T3CODE_HOST_WINDOW_HELPER_PATH or see native/README.md.",
         });
       }
 
@@ -253,26 +257,16 @@ export const layer = Layer.effect(
       HostWindowListResult,
       HostWindowUnavailableError | HostWindowOperationError
     > = Effect.gen(function* () {
-      // oxlint-disable-next-line t3code/no-global-process-runtime -- Non-macOS servers report unsupported cleanly instead of throwing.
-      if (process.platform !== "darwin") {
-        return {
-          supported: false,
-          status: "unsupported" as const,
-          detail: "Host application streaming is currently supported on macOS environments only.",
-          permissions: { screenRecording: false, accessibility: false },
-          windows: [],
-          displays: [],
-          streamBasePath: HOST_WINDOW_ROUTE_PREFIX,
-        };
-      }
-
       const binaryPath = resolveHelperBinaryPath();
       if (!binaryPath) {
+        // oxlint-disable-next-line t3code/no-global-process-runtime -- Report macOS vs non-macOS helper status cleanly.
+        const isMac = process.platform === "darwin";
         return {
-          supported: true,
-          status: "failed" as const,
-          detail:
-            "macOS window stream helper binary is not built yet. Run `node native/macos-window-stream/build.mjs` on this Mac.",
+          supported: isMac,
+          status: isMac ? ("failed" as const) : ("unsupported" as const),
+          detail: isMac
+            ? "macOS window stream helper binary is not built yet. Run `node native/macos-window-stream/build.mjs` on this Mac."
+            : "Host application streaming requires a platform helper binary. See native/README.md or set T3CODE_HOST_WINDOW_HELPER_PATH.",
           permissions: { screenRecording: false, accessibility: false },
           windows: [],
           displays: [],

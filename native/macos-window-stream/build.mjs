@@ -29,6 +29,7 @@ const root = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const sources = [
   "Models.swift",
   "WindowDiscovery.swift",
+  "VirtualDisplayManager.swift",
   "H264Encoder.swift",
   "CaptureManager.swift",
   "InputInjector.swift",

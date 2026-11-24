@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vite-plus/test";
 import {
+  AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   AuthSessionId,
   HostWindowUnavailableError,
@@ -107,5 +108,44 @@ describe("host window proxy", () => {
     const { handler } = fixture([AuthOrchestrationReadScope], false);
     const response = await handler(new Request("https://env.test/api/host-window/windows"));
     expect(response.status).toBe(503);
+  });
+
+  it("proxies file uploads and virtual display CRUD with operate scope", async () => {
+    const { handler, requests, headers } = fixture([
+      AuthOrchestrationReadScope,
+      AuthOrchestrationOperateScope,
+    ]);
+
+    const upload = await handler(
+      new Request("https://env.test/api/host-window/window/42/upload", {
+        method: "POST",
+        headers: {
+          "content-type": "image/png",
+          "x-filename": "screenshot.png",
+        },
+        body: new Uint8Array([1, 2, 3, 4]),
+      }),
+    );
+    expect(upload.status).toBe(200);
+    expect(requests[0]).toBe("http://127.0.0.1:45555/window/42/upload");
+    expect(headers[0]?.["x-filename"]).toBe("screenshot.png");
+
+    const createDisplay = await handler(
+      new Request("https://env.test/api/host-window/displays/virtual", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ width: 1440, height: 960, hiDPI: true }),
+      }),
+    );
+    expect(createDisplay.status).toBe(200);
+    expect(requests[1]).toBe("http://127.0.0.1:45555/displays/virtual");
+
+    const deleteDisplay = await handler(
+      new Request("https://env.test/api/host-window/displays/virtual/4", {
+        method: "DELETE",
+      }),
+    );
+    expect(deleteDisplay.status).toBe(200);
+    expect(requests[2]).toBe("http://127.0.0.1:45555/displays/virtual/4");
   });
 });

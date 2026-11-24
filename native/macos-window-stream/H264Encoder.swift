@@ -23,6 +23,7 @@ final class H264Encoder {
     width: Int32,
     height: Int32,
     fps: Int32 = 60,
+    quality: StreamQualityPreset = .balanced,
     onDescription: @escaping (Data) -> Void,
     onFrame: @escaping (Bool, Data) -> Void
   ) {
@@ -56,9 +57,8 @@ final class H264Encoder {
     }
     self.session = session
 
-    // Scale bitrate proportionally to pixel area (3 Mbps .. 12 Mbps).
     let pixels = Double(evenW) * Double(evenH)
-    let bitrate = Int32(max(3_000_000, min(12_000_000, pixels * 4.0)))
+    let bitrate = quality.targetBitrate(pixels: pixels)
 
     VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
     VTSessionSetProperty(
@@ -74,7 +74,9 @@ final class H264Encoder {
     VTSessionSetProperty(
       session,
       key: kVTCompressionPropertyKey_ProfileLevel,
-      value: kVTProfileLevel_H264_Main_AutoLevel
+      value: quality.useHighProfile
+        ? kVTProfileLevel_H264_High_AutoLevel
+        : kVTProfileLevel_H264_Main_AutoLevel
     )
     VTSessionSetProperty(
       session,
@@ -91,20 +93,41 @@ final class H264Encoder {
       key: kVTCompressionPropertyKey_ExpectedFrameRate,
       value: NSNumber(value: fps)
     )
+    applyBitrate(session: session, bitrate: bitrate)
+
+    VTCompressionSessionPrepareToEncodeFrames(session)
+  }
+
+  private func applyBitrate(session: VTCompressionSession, bitrate: Int32) {
     VTSessionSetProperty(
       session,
       key: kVTCompressionPropertyKey_AverageBitRate,
       value: NSNumber(value: bitrate)
     )
-    // Peak data rate limit (bytes per second, 1s window) for smooth interactive scrolling.
     let peakBytesPerSec = Int(Double(bitrate) * 1.5 / 8.0)
     VTSessionSetProperty(
       session,
       key: kVTCompressionPropertyKey_DataRateLimits,
       value: [peakBytesPerSec, 1] as CFArray
     )
+  }
 
-    VTCompressionSessionPrepareToEncodeFrames(session)
+  func updateBitrate(quality: StreamQualityPreset) {
+    lock.lock()
+    let s = session
+    lock.unlock()
+    guard let s else { return }
+    let pixels = Double(width) * Double(height)
+    applyBitrate(session: s, bitrate: quality.targetBitrate(pixels: pixels))
+  }
+
+  func updateBitrate(bps: Int32) {
+    lock.lock()
+    let s = session
+    lock.unlock()
+    guard let s else { return }
+    let clamped = max(600_000, min(16_000_000, bps))
+    applyBitrate(session: s, bitrate: clamped)
   }
 
   deinit {

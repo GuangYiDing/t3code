@@ -64,12 +64,14 @@ final class StreamSubscriber: @unchecked Sendable {
 final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
   let target: CaptureTargetKey
   private let captureQueue = DispatchQueue(label: "t3.window.capture", qos: .userInteractive)
+  private let audioQueue = DispatchQueue(label: "t3.window.audio", qos: .userInteractive)
   private let lock = NSLock()
 
   private var stream: SCStream?
   private var encoder: H264Encoder?
   private var avccSubscribers: [UUID: StreamSubscriber] = [:]
   private var mjpegSubscribers: [UUID: StreamSubscriber] = [:]
+  private var audioSubscribers: [UUID: StreamSubscriber] = [:]
   private var metaSubscribers: [UUID: (ScreenMetaMessage) -> Void] = [:]
 
   private var latestDescription: Data?
@@ -81,11 +83,14 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
   private var currentPointWidth: Int = 0
   private var currentPointHeight: Int = 0
   private var currentScale: Double = 2.0
+  private var quality: StreamQualityPreset = .balanced
+  private var audioEnabledInStream = false
   private var targetTitle: String?
   private var targetAppName: String?
   private var isStarting = false
   private var isRunning = false
   private var idleWorkItem: DispatchWorkItem?
+  private var resizeDebounceWorkItem: DispatchWorkItem?
   private let onIdleStop: (CaptureTargetKey) -> Void
 
   init(target: CaptureTargetKey, onIdleStop: @escaping (CaptureTargetKey) -> Void) {
@@ -131,9 +136,90 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
   func removeAvccSubscriber(_ id: UUID) {
     let empty: Bool = lock.withLock {
       avccSubscribers.removeValue(forKey: id)
-      return avccSubscribers.isEmpty && mjpegSubscribers.isEmpty
+      return avccSubscribers.isEmpty && mjpegSubscribers.isEmpty && audioSubscribers.isEmpty
     }
     if empty { scheduleIdleStop() }
+  }
+
+  func addAudioSubscriber(_ sub: StreamSubscriber) async throws {
+    let (needStart, needEnableAudio): (Bool, Bool) = lock.withLock {
+      idleWorkItem?.cancel()
+      idleWorkItem = nil
+      audioSubscribers[sub.id] = sub
+      let shouldStart = !isRunning && !isStarting
+      if shouldStart { isStarting = true }
+      let shouldEnable = isRunning && !audioEnabledInStream
+      return (shouldStart, shouldEnable)
+    }
+
+    if needStart {
+      do {
+        try await startCapture()
+      } catch {
+        lock.withLock {
+          isStarting = false
+          audioSubscribers.removeValue(forKey: sub.id)
+        }
+        throw error
+      }
+    } else if needEnableAudio {
+      await reconfigureStream()
+    }
+  }
+
+  func removeAudioSubscriber(_ id: UUID) {
+    let (empty, needDisableAudio): (Bool, Bool) = lock.withLock {
+      audioSubscribers.removeValue(forKey: id)
+      let noClients = avccSubscribers.isEmpty && mjpegSubscribers.isEmpty && audioSubscribers.isEmpty
+      let shouldDisable = isRunning && audioEnabledInStream && audioSubscribers.isEmpty
+      return (noClients, shouldDisable)
+    }
+    if empty {
+      scheduleIdleStop()
+    } else if needDisableAudio {
+      Task { await self.reconfigureStream() }
+    }
+  }
+
+  func requestKeyframe() {
+    lock.withLock {
+      encoder?.requestKeyframe()
+    }
+  }
+
+  func setTargetBitrate(bps: Int32) {
+    lock.withLock {
+      encoder?.updateBitrate(bps: bps)
+    }
+  }
+
+  func refreshTargetDimensions() {
+    guard case .window(let windowId) = target else { return }
+    guard let info = WindowDiscovery.shared.liveWindowInfo(windowId: windowId) else { return }
+    let newW = max(16, Int(info.bounds.width.rounded()))
+    let newH = max(16, Int(info.bounds.height.rounded()))
+    let scale = Self.displayScaleForRect(info.bounds)
+    let changed: Bool = lock.withLock {
+      abs(newW - currentPointWidth) >= 2 || abs(newH - currentPointHeight) >= 2
+    }
+    if changed {
+      handleResize(pointW: newW, pointH: newH, scale: scale)
+    }
+  }
+
+  func setQuality(_ preset: StreamQualityPreset) {
+    let (changed, wasRunning, sameProfile): (Bool, Bool, Bool) = lock.withLock {
+      if quality == preset { return (false, isRunning, true) }
+      let oldProfile = quality.useHighProfile
+      quality = preset
+      return (true, isRunning, oldProfile == preset.useHighProfile)
+    }
+    guard changed else { return }
+    if wasRunning {
+      Task {
+        await self.reconfigureStream(forceRecreateEncoder: !sameProfile)
+      }
+    }
   }
 
   func addMjpegSubscriber(_ sub: StreamSubscriber) async throws {
@@ -166,7 +252,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
   func removeMjpegSubscriber(_ id: UUID) {
     let empty: Bool = lock.withLock {
       mjpegSubscribers.removeValue(forKey: id)
-      return avccSubscribers.isEmpty && mjpegSubscribers.isEmpty
+      return avccSubscribers.isEmpty && mjpegSubscribers.isEmpty && audioSubscribers.isEmpty
     }
     if empty { scheduleIdleStop() }
   }
@@ -199,7 +285,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     let item = DispatchWorkItem { [weak self] in
       guard let self else { return }
       self.lock.lock()
-      let stillEmpty = self.avccSubscribers.isEmpty && self.mjpegSubscribers.isEmpty
+      let stillEmpty =
+        self.avccSubscribers.isEmpty && self.mjpegSubscribers.isEmpty && self.audioSubscribers.isEmpty
       self.lock.unlock()
       if stillEmpty {
         Task {
@@ -252,11 +339,25 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
       appName = "macOS Display"
     }
 
-    let (encW, encH) = Self.targetPixelDimensions(pointW: pointW, pointH: pointH, scale: scale)
-    let config = Self.makeStreamConfig(width: encW, height: encH)
+    let (activeQuality, wantAudio): (StreamQualityPreset, Bool) = lock.withLock {
+      (quality, !audioSubscribers.isEmpty)
+    }
+    let (encW, encH) = Self.targetPixelDimensions(
+      pointW: pointW,
+      pointH: pointH,
+      scale: scale,
+      maxSide: activeQuality.maxSide
+    )
+    let config = Self.makeStreamConfig(
+      width: encW,
+      height: encH,
+      fps: activeQuality.targetFps,
+      capturesAudio: wantAudio
+    )
 
     let scStream = SCStream(filter: filter, configuration: config, delegate: self)
     try scStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
+    try? scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
 
     let meta = ScreenMetaMessage(
       type: "screen",
@@ -267,43 +368,81 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
       appName: appName
     )
 
-    let metas: [(ScreenMetaMessage) -> Void] = lock.withLock {
+    let (metas, oldEnc): ([(ScreenMetaMessage) -> Void], H264Encoder?) = lock.withLock {
       self.stream = scStream
       self.currentPointWidth = pointW
       self.currentPointHeight = pointH
       self.currentScale = scale
+      self.audioEnabledInStream = wantAudio
       self.targetTitle = title
       self.targetAppName = appName
       self.latestMeta = meta
-      self.recreateEncoderLocked(width: Int32(encW), height: Int32(encH))
+      let prev = self.recreateEncoderLocked(width: Int32(encW), height: Int32(encH))
       self.isStarting = false
       self.isRunning = true
-      return Array(self.metaSubscribers.values)
+      return (Array(self.metaSubscribers.values), prev)
     }
+    oldEnc?.invalidate()
 
     for cb in metas { cb(meta) }
 
     try await scStream.startCapture()
   }
 
+  private func reconfigureStream(forceRecreateEncoder: Bool = false) async {
+    let snapshot: (SCStream?, Int, Int, Double, StreamQualityPreset, Bool) = lock.withLock {
+      let wantAudio = !audioSubscribers.isEmpty
+      audioEnabledInStream = wantAudio
+      return (stream, currentPointWidth, currentPointHeight, currentScale, quality, wantAudio)
+    }
+    guard let scStream = snapshot.0, snapshot.1 > 0, snapshot.2 > 0 else { return }
+    let (encW, encH) = Self.targetPixelDimensions(
+      pointW: snapshot.1,
+      pointH: snapshot.2,
+      scale: snapshot.3,
+      maxSide: snapshot.4.maxSide
+    )
+    let cfg = Self.makeStreamConfig(
+      width: encW,
+      height: encH,
+      fps: snapshot.4.targetFps,
+      capturesAudio: snapshot.5
+    )
+    try? await scStream.updateConfiguration(cfg)
+    let oldEnc: H264Encoder? = lock.withLock {
+      if forceRecreateEncoder
+        || currentPixelWidth != Int32(encW & ~1)
+        || currentPixelHeight != Int32(encH & ~1)
+      {
+        return recreateEncoderLocked(width: Int32(encW), height: Int32(encH))
+      } else {
+        encoder?.updateBitrate(quality: snapshot.4)
+        encoder?.requestKeyframe()
+        return nil
+      }
+    }
+    oldEnc?.invalidate()
+  }
+
   func stopCapture() async {
-    let scStream: SCStream? = lock.withLock {
+    let (scStream, oldEnc): (SCStream?, H264Encoder?) = lock.withLock {
       let existing = stream
+      let prevEnc = encoder
       stream = nil
-      encoder?.invalidate()
       encoder = nil
       isRunning = false
       isStarting = false
-      return existing
+      return (existing, prevEnc)
     }
+    oldEnc?.invalidate()
 
     if let scStream {
       try? await scStream.stopCapture()
     }
   }
 
-  private func recreateEncoderLocked(width: Int32, height: Int32) {
-    encoder?.invalidate()
+  private func recreateEncoderLocked(width: Int32, height: Int32) -> H264Encoder? {
+    let oldEncoder = encoder
     currentPixelWidth = width & ~1
     currentPixelHeight = height & ~1
     latestDescription = nil
@@ -311,7 +450,8 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     encoder = H264Encoder(
       width: currentPixelWidth,
       height: currentPixelHeight,
-      fps: 60,
+      fps: quality.targetFps,
+      quality: quality,
       onDescription: { [weak self] avcC in
         guard let self else { return }
         let packet = AvccWire.pack(tag: .description, payload: avcC)
@@ -330,6 +470,7 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
         for s in subs { s.enqueue(packet, droppable: !isKey) }
       }
     )
+    return oldEncoder
   }
 
   func stream(
@@ -337,8 +478,12 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
     of type: SCStreamOutputType
   ) {
-    guard type == .screen else { return }
     guard CMSampleBufferIsValid(sampleBuffer) else { return }
+    if type == .audio {
+      handleAudioSample(sampleBuffer)
+      return
+    }
+    guard type == .screen else { return }
 
     // Ignore idle / blank status frames from ScreenCaptureKit.
     if let attachments = CMSampleBufferGetSampleAttachmentsArray(
@@ -370,16 +515,18 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     let bufH = Int32(CVPixelBufferGetHeight(pixelBuffer))
     guard bufW >= 2, bufH >= 2 else { return }
 
+    var oldEnc: H264Encoder?
     lock.lock()
     let hasAvcc = !avccSubscribers.isEmpty
     let hasMjpeg = !mjpegSubscribers.isEmpty
     let needSeed = (latestSeedJpeg == nil)
     if hasAvcc && (encoder == nil || currentPixelWidth != (bufW & ~1) || currentPixelHeight != (bufH & ~1)) {
-      recreateEncoderLocked(width: bufW, height: bufH)
+      oldEnc = recreateEncoderLocked(width: bufW, height: bufH)
     }
     let enc = encoder
     let mjpegSubs = hasMjpeg ? Array(mjpegSubscribers.values) : []
     lock.unlock()
+    oldEnc?.invalidate()
 
     if needSeed || hasMjpeg {
       let now = CFAbsoluteTimeGetCurrent()
@@ -410,8 +557,99 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     }
   }
 
+  private func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+    let subs: [StreamSubscriber] = lock.withLock {
+      audioSubscribers.isEmpty ? [] : Array(audioSubscribers.values)
+    }
+    guard !subs.isEmpty else { return }
+    guard let pcm = Self.extractInterleavedInt16Pcm(sampleBuffer) else { return }
+    for sub in subs {
+      sub.enqueue(pcm, droppable: true)
+    }
+  }
+
+  /// Extracts interleaved 16-bit little-endian stereo PCM from ScreenCaptureKit's Float32 audio sample buffer.
+  private static func extractInterleavedInt16Pcm(_ sampleBuffer: CMSampleBuffer) -> Data? {
+    let numFrames = CMSampleBufferGetNumSamples(sampleBuffer)
+    guard numFrames > 0 else { return nil }
+    guard let fmt = CMSampleBufferGetFormatDescription(sampleBuffer),
+      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fmt)?.pointee
+    else {
+      return nil
+    }
+    let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+    let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+    guard isFloat else { return nil }
+
+    var bufferListSize = 0
+    CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      sampleBuffer,
+      bufferListSizeNeededOut: &bufferListSize,
+      bufferListOut: nil,
+      bufferListSize: 0,
+      blockBufferAllocator: nil,
+      blockBufferMemoryAllocator: nil,
+      flags: 0,
+      blockBufferOut: nil
+    )
+    guard bufferListSize > 0 else { return nil }
+
+    let rawList = UnsafeMutableRawPointer.allocate(
+      byteCount: bufferListSize,
+      alignment: MemoryLayout<AudioBufferList>.alignment
+    )
+    defer { rawList.deallocate() }
+    let ablPtr = rawList.bindMemory(to: AudioBufferList.self, capacity: 1)
+
+    var blockBuffer: CMBlockBuffer?
+    let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+      sampleBuffer,
+      bufferListSizeNeededOut: nil,
+      bufferListOut: ablPtr,
+      bufferListSize: bufferListSize,
+      blockBufferAllocator: kCFAllocatorDefault,
+      blockBufferMemoryAllocator: kCFAllocatorDefault,
+      flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+      blockBufferOut: &blockBuffer
+    )
+    guard status == noErr else { return nil }
+    let buffers = UnsafeMutableAudioBufferListPointer(ablPtr)
+    guard !buffers.isEmpty else { return nil }
+
+    var out = Data(count: numFrames * 2 * MemoryLayout<Int16>.size)
+    out.withUnsafeMutableBytes { outRaw in
+      let dst = outRaw.bindMemory(to: Int16.self)
+      if isNonInterleaved {
+        guard let leftRaw = buffers[0].mData else { return }
+        let left = leftRaw.bindMemory(to: Float32.self, capacity: numFrames)
+        let right: UnsafePointer<Float32>
+        if buffers.count >= 2, let rightRaw = buffers[1].mData {
+          right = UnsafePointer(rightRaw.bindMemory(to: Float32.self, capacity: numFrames))
+        } else {
+          right = UnsafePointer(left)
+        }
+        for i in 0..<numFrames {
+          let l = max(-1.0, min(1.0, left[i]))
+          let r = max(-1.0, min(1.0, right[i]))
+          dst[i * 2] = Int16(l * 32767.0).littleEndian
+          dst[i * 2 + 1] = Int16(r * 32767.0).littleEndian
+        }
+      } else {
+        guard let rawData = buffers[0].mData else { return }
+        let ch = max(1, Int(asbd.mChannelsPerFrame))
+        let src = rawData.bindMemory(to: Float32.self, capacity: numFrames * ch)
+        for i in 0..<numFrames {
+          let l = max(-1.0, min(1.0, src[i * ch]))
+          let r = ch >= 2 ? max(-1.0, min(1.0, src[i * ch + 1])) : l
+          dst[i * 2] = Int16(l * 32767.0).littleEndian
+          dst[i * 2 + 1] = Int16(r * 32767.0).littleEndian
+        }
+      }
+    }
+    return out
+  }
+
   private func handleResize(pointW: Int, pointH: Int, scale: Double) {
-    let (encW, encH) = Self.targetPixelDimensions(pointW: pointW, pointH: pointH, scale: scale)
     let meta = ScreenMetaMessage(
       type: "screen",
       width: pointW,
@@ -426,18 +664,17 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     currentPointHeight = pointH
     currentScale = scale
     latestMeta = meta
-    let scStream = stream
     let metas = Array(metaSubscribers.values)
+    resizeDebounceWorkItem?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      Task { await self.reconfigureStream() }
+    }
+    resizeDebounceWorkItem = work
     lock.unlock()
 
     for cb in metas { cb(meta) }
-
-    if let scStream {
-      let cfg = Self.makeStreamConfig(width: encW, height: encH)
-      Task {
-        try? await scStream.updateConfiguration(cfg)
-      }
-    }
+    DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.12, execute: work)
   }
 
   func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -459,27 +696,40 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
     return WindowDiscovery.shared.displayScaleFactor(CGMainDisplayID())
   }
 
-  private static func targetPixelDimensions(pointW: Int, pointH: Int, scale: Double) -> (Int, Int) {
+  private static func targetPixelDimensions(
+    pointW: Int,
+    pointH: Int,
+    scale: Double,
+    maxSide: Double = 1920.0
+  ) -> (Int, Int) {
     let rawW = Double(pointW) * scale
     let rawH = Double(pointH) * scale
-    let maxSide = 2240.0
     let factor = min(1.0, maxSide / max(rawW, rawH))
     let w = max(2, Int((rawW * factor).rounded()) & ~1)
     let h = max(2, Int((rawH * factor).rounded()) & ~1)
     return (w, h)
   }
 
-  private static func makeStreamConfig(width: Int, height: Int) -> SCStreamConfiguration {
+  private static func makeStreamConfig(
+    width: Int,
+    height: Int,
+    fps: Int32 = 60,
+    capturesAudio: Bool = false
+  ) -> SCStreamConfiguration {
     let config = SCStreamConfiguration()
     config.width = width
     config.height = height
     config.scalesToFit = true
-    config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+    config.minimumFrameInterval = CMTime(value: 1, timescale: fps)
     config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     // Hide the host OS cursor in the video stream so clients render a single zero-latency
     // local cursor (native hardware cursor or virtual trackpad pointer) with synced shape.
     config.showsCursor = false
     config.queueDepth = 2
+    config.capturesAudio = capturesAudio
+    config.excludesCurrentProcessAudio = true
+    config.sampleRate = 48000
+    config.channelCount = 2
     return config
   }
 

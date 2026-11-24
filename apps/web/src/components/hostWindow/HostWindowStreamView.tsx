@@ -2,17 +2,21 @@ import type { DeviceHubAccess } from "@t3tools/client-runtime/device/hub-access"
 import {
   createHostWindowStreamClient,
   hostWindowModifiers,
+  type HostWindowActiveTransport,
   type HostWindowCursorShape,
   type HostWindowInputCommand,
   type HostWindowMouseButton,
+  type HostWindowQualityPreset,
   type HostWindowScreenMeta,
   type HostWindowStreamClient,
   type HostWindowStreamStats,
   type HostWindowStreamStatus,
+  type HostWindowTransportMode,
 } from "@t3tools/client-runtime/host-window/stream";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { T, useGT, Var } from "gt-react";
 import {
+  ClipboardCopy,
   ClipboardPaste,
   CornerDownLeft,
   Focus,
@@ -20,9 +24,15 @@ import {
   HelpCircle,
   Keyboard,
   Layers,
+  Maximize2,
+  Minimize2,
   Monitor,
   MousePointer2,
   RefreshCw,
+  Scan,
+  Upload,
+  Volume2,
+  VolumeX,
   X,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -48,6 +58,27 @@ const isTouchFirstDevice = (): boolean => {
   if (typeof window === "undefined") return false;
   if (window.matchMedia?.("(pointer: coarse)").matches) return true;
   return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+};
+
+const isNonMacPlatform = (): boolean => {
+  if (typeof navigator === "undefined") return false;
+  return !/Mac|iPhone|iPad|iPod/i.test(navigator.userAgent);
+};
+
+const triggerHaptic = (ms = 15) => {
+  try {
+    navigator.vibrate?.(ms);
+  } catch {}
+};
+
+const QUALITY_ORDER: ReadonlyArray<HostWindowQualityPreset> = ["balanced", "crisp", "speed"];
+
+const swapCtrlAndMeta = (modifiers: number, enabled: boolean): number => {
+  if (!enabled) return modifiers;
+  const hasCtrl = (modifiers & 2) !== 0;
+  const hasMeta = (modifiers & 4) !== 0;
+  const cleared = modifiers & ~(2 | 4);
+  return cleared | (hasCtrl ? 4 : 0) | (hasMeta ? 2 : 0);
 };
 
 const SINGLE_TAP_MAX_DIST_PX = 10;
@@ -140,10 +171,13 @@ export function HostWindowStreamView(props: {
   readonly onSwitchWindow: () => void;
 }) {
   const gt = useGT();
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const mjpegRef = useRef<HTMLImageElement | null>(null);
   const imeInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const clientRef = useRef<HostWindowStreamClient | null>(null);
   const lastClickRef = useRef<{
     ts: number;
@@ -191,8 +225,8 @@ export function HostWindowStreamView(props: {
 
   const [status, setStatus] = useState<HostWindowStreamStatus>("connecting");
   const [statusDetail, setStatusDetail] = useState<string | null>(null);
-  const [mjpegMode, setMjpegMode] = useState(false);
-  const [preferMjpeg, setPreferMjpeg] = useState(false);
+  const [activeTransport, setActiveTransport] = useState<HostWindowActiveTransport>("webrtc");
+  const [transportMode, setTransportMode] = useState<HostWindowTransportMode>("auto");
   const [inputConnected, setInputConnected] = useState(false);
   const [screen, setScreen] = useState<HostWindowScreenMeta | null>(null);
   const [stats, setStats] = useState<HostWindowStreamStats | null>(null);
@@ -207,8 +241,16 @@ export function HostWindowStreamView(props: {
   const [viewport, setViewport] = useState<ViewportTransform>(DEFAULT_VIEWPORT);
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [stickyMods, setStickyMods] = useState(0);
+  const [swapCtrlMeta, setSwapCtrlMeta] = useState(() => isNonMacPlatform());
   const [showGestureGuide, setShowGestureGuide] = useState(false);
   const [ripple, setRipple] = useState<TouchFeedbackRipple | null>(null);
+  const [quality, setQuality] = useState<HostWindowQualityPreset>("balanced");
+  const [audioEnabled, setAudioEnabled] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [dragOverFiles, setDragOverFiles] = useState(false);
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null);
+  const [pendingHostClipboard, setPendingHostClipboard] = useState<string | null>(null);
+  const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearLongPressTimer = () => {
     const timer = touchSessionRef.current.longPressTimer;
@@ -229,7 +271,7 @@ export function HostWindowStreamView(props: {
         kind: props.target.kind,
         id: props.target.id,
         access: props.access,
-        preferMjpeg,
+        transport: transportMode,
       },
       canvas,
       {
@@ -240,16 +282,36 @@ export function HostWindowStreamView(props: {
         onScreen: (meta) => setScreen(meta),
         onStats: (nextStats) => setStats(nextStats),
         onCursor: (cursor) => setHostCursor(cursor),
+        onAudioState: (enabled) => setAudioEnabled(enabled),
+        onTransportChange: (nextTransport) => {
+          setActiveTransport(nextTransport);
+          if (nextTransport === "webrtc" && videoRef.current) {
+            client.setVideoElement(videoRef.current);
+          } else if (nextTransport === "mjpeg" && mjpegRef.current) {
+            client.setMjpegImage(mjpegRef.current);
+          }
+        },
+        onClipboard: (text) => {
+          void navigator.clipboard
+            ?.writeText(text)
+            .then(() => {
+              setPendingHostClipboard(null);
+            })
+            .catch(() => {
+              setPendingHostClipboard(text);
+            });
+        },
         onMjpegFallback: () => {
-          setMjpegMode(true);
+          setActiveTransport("mjpeg");
           if (mjpegRef.current) client.setMjpegImage(mjpegRef.current);
         },
-        onCanvasVideo: () => setMjpegMode(false),
+        onCanvasVideo: () => setActiveTransport("avcc"),
         onInputConnected: (connected) => setInputConnected(connected),
         onUnauthorized: () => refreshHostWindowAccess(props.environmentId),
       },
     );
     clientRef.current = client;
+    if (videoRef.current) client.setVideoElement(videoRef.current);
     if (mjpegRef.current) client.setMjpegImage(mjpegRef.current);
     client.start();
 
@@ -257,6 +319,7 @@ export function HostWindowStreamView(props: {
       if (moveRafRef.current !== null) cancelAnimationFrame(moveRafRef.current);
       if (wheelRafRef.current !== null) cancelAnimationFrame(wheelRafRef.current);
       if (rippleTimerRef.current !== null) clearTimeout(rippleTimerRef.current);
+      if (noticeTimerRef.current !== null) clearTimeout(noticeTimerRef.current);
       const timer = touchSessionRef.current.longPressTimer;
       if (timer !== null) clearTimeout(timer);
       touchSessionRef.current.longPressTimer = null;
@@ -265,6 +328,7 @@ export function HostWindowStreamView(props: {
       moveRafRef.current = null;
       wheelRafRef.current = null;
       rippleTimerRef.current = null;
+      noticeTimerRef.current = null;
       pendingMoveRef.current = null;
       pendingWheelRef.current = null;
       client.stop();
@@ -276,15 +340,36 @@ export function HostWindowStreamView(props: {
     props.target.id,
     props.target.kind,
     props.visible,
-    preferMjpeg,
+    transportMode,
   ]);
+
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- tracks browser fullscreenchange events and releases keyboard lock on exit.
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      const active = document.fullscreenElement === rootRef.current;
+      setIsFullscreen(active);
+      if (!active) {
+        try {
+          (navigator as Navigator & { keyboard?: { unlock?: () => void } }).keyboard?.unlock?.();
+        } catch {}
+      }
+    };
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
+    };
+  }, []);
 
   const sendInput = (command: HostWindowInputCommand) => {
     clientRef.current?.sendInput(command);
   };
 
   const activeMediaElement = (): HTMLElement | null =>
-    mjpegMode ? mjpegRef.current : canvasRef.current;
+    activeTransport === "webrtc"
+      ? videoRef.current
+      : activeTransport === "mjpeg"
+        ? mjpegRef.current
+        : canvasRef.current;
 
   const updateViewport = (next: ViewportTransform) => {
     viewportRef.current = next;
@@ -301,6 +386,9 @@ export function HostWindowStreamView(props: {
   };
 
   const triggerRipple = (point: NormalizedPoint, kind: "left" | "right" | "drag") => {
+    if (kind === "right" || kind === "drag") {
+      triggerHaptic(15);
+    }
     const id = ++rippleIdRef.current;
     setRipple({ id, x: point.x, y: point.y, kind });
     if (rippleTimerRef.current !== null) clearTimeout(rippleTimerRef.current);
@@ -308,6 +396,93 @@ export function HostWindowStreamView(props: {
       rippleTimerRef.current = null;
       setRipple((curr) => (curr?.id === id ? null : curr));
     }, 320);
+  };
+
+  const showTransientNotice = (text: string) => {
+    setUploadNotice(text);
+    if (noticeTimerRef.current !== null) clearTimeout(noticeTimerRef.current);
+    noticeTimerRef.current = setTimeout(() => {
+      noticeTimerRef.current = null;
+      setUploadNotice(null);
+    }, 2_600);
+  };
+
+  const handleFitWindowToScreen = () => {
+    const stage = stageRef.current;
+    if (!stage || props.target.kind !== "window") return;
+    const rect = stage.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const ratio = rect.width / rect.height;
+    const desiredW = Math.min(1800, Math.max(800, Math.round(rect.width * 1.45)));
+    const desiredH = Math.min(1200, Math.max(540, Math.round(desiredW / ratio)));
+    sendInput({ type: "resize", width: desiredW, height: desiredH });
+    resetViewport();
+  };
+
+  const handleToggleFullscreen = () => {
+    const root = rootRef.current as
+      | (HTMLDivElement & { webkitRequestFullscreen?: () => Promise<void> | void })
+      | null;
+    if (!root) return;
+    if (document.fullscreenElement === root) {
+      void document.exitFullscreen?.().catch(() => {});
+      return;
+    }
+    const req = root.requestFullscreen
+      ? root.requestFullscreen()
+      : Promise.resolve(root.webkitRequestFullscreen?.());
+    void Promise.resolve(req)
+      .then(() => {
+        try {
+          const kb = (
+            navigator as Navigator & { keyboard?: { lock?: (keys: string[]) => Promise<void> } }
+          ).keyboard;
+          void kb?.lock?.(["KeyW", "KeyT", "KeyR", "KeyL", "Escape"]).catch(() => {});
+        } catch {}
+      })
+      .catch(() => {});
+  };
+
+  const handleCycleQuality = () => {
+    const next =
+      QUALITY_ORDER[(QUALITY_ORDER.indexOf(quality) + 1) % QUALITY_ORDER.length] ?? "balanced";
+    setQuality(next);
+    clientRef.current?.setQuality(next);
+  };
+
+  const handleToggleAudio = () => {
+    if (audioEnabled) {
+      clientRef.current?.stopAudio();
+    } else {
+      clientRef.current?.startAudio();
+    }
+  };
+
+  const handleUploadFiles = async (files: FileList | ReadonlyArray<File>) => {
+    const client = clientRef.current;
+    if (!client) return;
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    for (const file of list) {
+      try {
+        showTransientNotice(gt("Sending {name}…", { name: file.name }));
+        const result = await client.uploadFile(file);
+        showTransientNotice(gt("Pasted {name}", { name: result.filename }));
+      } catch {
+        showTransientNotice(gt("Failed to send {name}", { name: file.name }));
+      }
+    }
+  };
+
+  const handleCopyPendingHostClipboard = () => {
+    if (!pendingHostClipboard) return;
+    void navigator.clipboard
+      ?.writeText(pendingHostClipboard)
+      .then(() => {
+        setPendingHostClipboard(null);
+        showTransientNotice(gt("Copied Mac clipboard"));
+      })
+      .catch(() => {});
   };
 
   const queueMove = (command: HostWindowInputCommand) => {
@@ -346,7 +521,12 @@ export function HostWindowStreamView(props: {
     const stage = stageRef.current;
     if (!stage) return;
     const onNativeWheel = (event: WheelEvent) => {
-      const mediaEl = mjpegMode ? mjpegRef.current : canvasRef.current;
+      const mediaEl =
+        activeTransport === "webrtc"
+          ? videoRef.current
+          : activeTransport === "mjpeg"
+            ? mjpegRef.current
+            : canvasRef.current;
       if (!mediaEl) return;
       const point = normalizedPointFromRect(
         mediaEl.getBoundingClientRect(),
@@ -380,7 +560,7 @@ export function HostWindowStreamView(props: {
     return () => {
       stage.removeEventListener("wheel", onNativeWheel);
     };
-  }, [mjpegMode]);
+  }, [activeTransport]);
 
   const computeClickCount = (
     x: number,
@@ -1020,7 +1200,9 @@ export function HostWindowStreamView(props: {
       action: "down",
       key: event.key,
       code: event.code,
-      modifiers: consumeEffectiveModifiers(hostWindowModifiers(event)),
+      modifiers: consumeEffectiveModifiers(
+        swapCtrlAndMeta(hostWindowModifiers(event), swapCtrlMeta),
+      ),
     });
   };
 
@@ -1040,7 +1222,7 @@ export function HostWindowStreamView(props: {
       action: "up",
       key: event.key,
       code: event.code,
-      modifiers: hostWindowModifiers(event),
+      modifiers: swapCtrlAndMeta(hostWindowModifiers(event), swapCtrlMeta),
     });
   };
 
@@ -1069,8 +1251,11 @@ export function HostWindowStreamView(props: {
     ? `url("${hostCursor.dataUrl}") ${hostCursor.hotspotX} ${hostCursor.hotspotY}, default`
     : "default";
 
+  const qualityLabel =
+    quality === "crisp" ? gt("Crisp") : quality === "speed" ? gt("Speed") : gt("Auto");
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-background">
+    <div ref={rootRef} className="flex min-h-0 flex-1 flex-col bg-background">
       <div className="flex shrink-0 items-center justify-between gap-2 border-b px-2.5 py-1.5">
         <div className="flex min-w-0 items-center gap-2">
           <Monitor className="size-3.5 shrink-0 text-muted-foreground" />
@@ -1083,7 +1268,7 @@ export function HostWindowStreamView(props: {
           {resolutionLabel ? (
             <span className="hidden shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-3xs text-muted-foreground sm:inline">
               {resolutionLabel}
-              {stats && !mjpegMode ? (
+              {stats && activeTransport !== "mjpeg" ? (
                 <T>
                   {" "}
                   · <Var>{stats.fps}</Var> fps
@@ -1097,7 +1282,7 @@ export function HostWindowStreamView(props: {
             </span>
           ) : null}
         </div>
-        <div className="flex shrink-0 items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1 overflow-x-auto">
           {isZoomed ? (
             <Button
               size="xs"
@@ -1150,11 +1335,37 @@ export function HostWindowStreamView(props: {
           ) : null}
           <Button
             size="xs"
+            variant={audioEnabled ? "secondary" : "ghost"}
+            title={audioEnabled ? gt("Mute app audio") : gt("Stream app audio")}
+            onClick={handleToggleAudio}
+          >
+            {audioEnabled ? <Volume2 className="size-3.5" /> : <VolumeX className="size-3.5" />}
+          </Button>
+          <Button
+            size="xs"
             variant={keyboardOpen ? "secondary" : "ghost"}
             title={keyboardOpen ? gt("Hide keyboard") : gt("Show keyboard")}
             onClick={toggleSoftKeyboard}
           >
             <Keyboard className="size-3.5" />
+          </Button>
+          {props.target.kind === "window" ? (
+            <Button
+              size="xs"
+              variant="ghost"
+              title={gt("Fit host window to this screen ratio")}
+              onClick={handleFitWindowToScreen}
+            >
+              <Scan className="size-3.5" />
+            </Button>
+          ) : null}
+          <Button
+            size="xs"
+            variant="ghost"
+            title={gt("Send file to host app")}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Upload className="size-3.5" />
           </Button>
           <Button
             size="xs"
@@ -1199,10 +1410,36 @@ export function HostWindowStreamView(props: {
           <Button
             size="xs"
             variant="ghost"
-            title={gt("Toggle H.264 / MJPEG mode")}
-            onClick={() => setPreferMjpeg((prev) => !prev)}
+            title={gt("Cycle stream quality (Auto / Crisp / Speed)")}
+            onClick={handleCycleQuality}
           >
-            <span className="font-mono text-3xs">{mjpegMode ? "MJPEG" : "H.264"}</span>
+            <span className="font-mono text-3xs">{qualityLabel}</span>
+          </Button>
+          <Button
+            size="xs"
+            variant="ghost"
+            title={gt("Switch transport (WebRTC UDP / H.264 / MJPEG)")}
+            onClick={() =>
+              setTransportMode((prev) =>
+                prev === "auto" || prev === "webrtc" ? "avcc" : prev === "avcc" ? "mjpeg" : "auto",
+              )
+            }
+          >
+            <span className="font-mono text-3xs">
+              {activeTransport === "webrtc"
+                ? "WebRTC"
+                : activeTransport === "mjpeg"
+                  ? "MJPEG"
+                  : "H.264"}
+            </span>
+          </Button>
+          <Button
+            size="xs"
+            variant={isFullscreen ? "secondary" : "ghost"}
+            title={isFullscreen ? gt("Exit fullscreen") : gt("Immersive fullscreen")}
+            onClick={handleToggleFullscreen}
+          >
+            {isFullscreen ? <Minimize2 className="size-3.5" /> : <Maximize2 className="size-3.5" />}
           </Button>
           <Button size="xs" variant="outline" onClick={props.onSwitchWindow}>
             <Layers className="mr-1 size-3" />
@@ -1211,12 +1448,37 @@ export function HostWindowStreamView(props: {
         </div>
       </div>
 
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(event) => {
+          if (event.currentTarget.files) {
+            void handleUploadFiles(event.currentTarget.files);
+            event.currentTarget.value = "";
+          }
+        }}
+      />
+
       <div
         ref={stageRef}
         tabIndex={0}
         className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/95 outline-none select-none"
         style={{ touchAction: "none", containerType: "size" }}
         onContextMenu={(event) => event.preventDefault()}
+        onDragOver={(event) => {
+          event.preventDefault();
+          if (!dragOverFiles) setDragOverFiles(true);
+        }}
+        onDragLeave={() => setDragOverFiles(false)}
+        onDrop={(event) => {
+          event.preventDefault();
+          setDragOverFiles(false);
+          if (event.dataTransfer.files.length > 0) {
+            void handleUploadFiles(event.dataTransfer.files);
+          }
+        }}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -1252,12 +1514,24 @@ export function HostWindowStreamView(props: {
             willChange: isZoomed ? "transform" : undefined,
           }}
         >
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            muted
+            className="size-full rounded-sm object-contain shadow-lg outline-none select-none"
+            style={{
+              display: activeTransport === "webrtc" ? "block" : "none",
+              cursor: cssCursor,
+            }}
+          />
+
           <canvas
             ref={canvasRef}
             tabIndex={-1}
             className="size-full rounded-sm shadow-lg outline-none select-none"
             style={{
-              display: mjpegMode ? "none" : "block",
+              display: activeTransport === "avcc" ? "block" : "none",
               cursor: cssCursor,
             }}
           />
@@ -1268,7 +1542,7 @@ export function HostWindowStreamView(props: {
             draggable={false}
             className="size-full rounded-sm object-contain shadow-lg outline-none select-none"
             style={{
-              display: mjpegMode ? "block" : "none",
+              display: activeTransport === "mjpeg" ? "block" : "none",
               cursor: cssCursor,
             }}
           />
@@ -1408,6 +1682,27 @@ export function HostWindowStreamView(props: {
           </div>
         ) : null}
 
+        {dragOverFiles ? (
+          <div className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-background/80 text-sm font-medium text-foreground">
+            <T>Drop files to paste into host app</T>
+          </div>
+        ) : null}
+
+        {uploadNotice || pendingHostClipboard ? (
+          <div
+            data-host-overlay="true"
+            className="absolute top-2 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border bg-popover/95 px-3 py-1 text-2xs text-popover-foreground shadow-md backdrop-blur-sm"
+          >
+            {uploadNotice ? <span>{uploadNotice}</span> : null}
+            {pendingHostClipboard ? (
+              <Button size="xs" variant="secondary" onClick={handleCopyPendingHostClipboard}>
+                <ClipboardCopy className="mr-1 size-3" />
+                <T>Copy from Mac</T>
+              </Button>
+            ) : null}
+          </div>
+        ) : null}
+
         {keyboardOpen ? (
           <div
             data-host-overlay="true"
@@ -1427,6 +1722,14 @@ export function HostWindowStreamView(props: {
                 </Button>
               );
             })}
+            <Button
+              size="xs"
+              variant={swapCtrlMeta ? "secondary" : "ghost"}
+              title={gt("Swap Ctrl and Command on external keyboard")}
+              onClick={() => setSwapCtrlMeta((prev) => !prev)}
+            >
+              <span className="font-mono text-3xs">⌃↔⌘</span>
+            </Button>
             <div className="mx-0.5 h-4 w-px shrink-0 bg-border" />
             {QUICK_NAV_KEYS.map((item) => (
               <Button
@@ -1530,7 +1833,9 @@ export function HostWindowStreamView(props: {
               action: "down",
               key: event.key,
               code: event.code,
-              modifiers: consumeEffectiveModifiers(hostWindowModifiers(event)),
+              modifiers: consumeEffectiveModifiers(
+                swapCtrlAndMeta(hostWindowModifiers(event), swapCtrlMeta),
+              ),
             });
           }}
           onKeyUp={(event) => {
@@ -1548,7 +1853,7 @@ export function HostWindowStreamView(props: {
               action: "up",
               key: event.key,
               code: event.code,
-              modifiers: hostWindowModifiers(event),
+              modifiers: swapCtrlAndMeta(hostWindowModifiers(event), swapCtrlMeta),
             });
           }}
         />

@@ -139,8 +139,9 @@ final class SocketConnection: @unchecked Sendable {
 
     var body = raw.subdata(in: range.upperBound..<raw.endIndex)
     if let lenStr = headers["content-length"], let expected = Int(lenStr), expected > body.count {
-      let remaining = min(expected - body.count, 1024 * 1024)
-      if let more = readExact(remaining) {
+      let maxBody = 50 * 1024 * 1024
+      let remaining = min(expected - body.count, max(0, maxBody - body.count))
+      if remaining > 0, let more = readExact(remaining) {
         body.append(more)
       }
     }
@@ -345,6 +346,52 @@ final class WindowStreamHttpServer {
       return
     }
 
+    if req.method == "GET" && req.path == "/displays/virtual" {
+      conn.sendJson(VirtualDisplayManager.shared.list())
+      return
+    }
+
+    if req.method == "POST" && req.path == "/displays/virtual" {
+      guard let payload = try? JSONDecoder().decode(VirtualDisplayCreateRequest.self, from: req.body)
+      else {
+        conn.sendHttpResponse(
+          status: "400 Bad Request",
+          contentType: "text/plain",
+          body: Data("Invalid virtual display request".utf8)
+        )
+        return
+      }
+      let name = (payload.name?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap {
+        $0.isEmpty ? nil : $0
+      } ?? "T3 Virtual Display"
+      if let created = VirtualDisplayManager.shared.create(
+        width: payload.width,
+        height: payload.height,
+        hiDPI: payload.hiDPI ?? true,
+        name: name
+      ) {
+        conn.sendJson(created, status: "201 Created")
+      } else {
+        conn.sendHttpResponse(
+          status: "503 Service Unavailable",
+          contentType: "text/plain",
+          body: Data("Virtual display creation unavailable on this macOS host".utf8)
+        )
+      }
+      return
+    }
+
+    if req.method == "DELETE" && req.path.hasPrefix("/displays/virtual/") {
+      let idStr = String(req.path.dropFirst("/displays/virtual/".count))
+      guard let id = UInt32(idStr) else {
+        conn.sendHttpResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("Invalid display id".utf8))
+        return
+      }
+      let removed = VirtualDisplayManager.shared.destroy(id: id)
+      conn.sendJson(["ok": removed])
+      return
+    }
+
     // Parse /window/:id/<action> or /display/:id/<action>
     let segs = req.path.split(separator: "/").map(String.init)
     guard segs.count == 3, (segs[0] == "window" || segs[0] == "display"), let rawId = UInt32(segs[1]) else {
@@ -368,6 +415,34 @@ final class WindowStreamHttpServer {
       serveAvccStream(conn: conn, target: target)
     case "stream.mjpeg":
       serveMjpegStream(conn: conn, target: target)
+    case "keyframe":
+      guard req.method == "POST" else {
+        conn.sendHttpResponse(status: "405 Method Not Allowed", contentType: "text/plain", body: Data("POST required".utf8))
+        return
+      }
+      CaptureManager.shared.session(for: target).requestKeyframe()
+      conn.sendJson(["ok": true])
+    case "bitrate":
+      guard req.method == "POST",
+        let payload = try? JSONDecoder().decode(BitrateUpdateRequest.self, from: req.body)
+      else {
+        conn.sendHttpResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("Invalid bitrate".utf8))
+        return
+      }
+      CaptureManager.shared.session(for: target).setTargetBitrate(bps: payload.bps)
+      conn.sendJson(["ok": true])
+    case "upload":
+      guard req.method == "POST" else {
+        conn.sendHttpResponse(status: "405 Method Not Allowed", contentType: "text/plain", body: Data("POST required".utf8))
+        return
+      }
+      handleFileUpload(conn: conn, req: req, target: target)
+    case "audio":
+      if req.headers["upgrade"]?.lowercased() == "websocket" {
+        serveAudioWebSocket(conn: conn, req: req, target: target)
+      } else {
+        conn.sendHttpResponse(status: "426 Upgrade Required", contentType: "text/plain", body: Data("WebSocket required".utf8))
+      }
     case "input":
       if req.headers["upgrade"]?.lowercased() == "websocket" {
         serveInputWebSocket(conn: conn, req: req, target: target)
@@ -471,6 +546,97 @@ final class WindowStreamHttpServer {
           }
           sub.markClosed()
           session.removeMjpegSubscriber(sub.id)
+          conn.close()
+        }
+      } catch {
+        sub.markClosed()
+        conn.close()
+      }
+    }
+  }
+
+  private func handleFileUpload(conn: SocketConnection, req: HttpRequest, target: CaptureTargetKey) {
+    let rawHeader = req.headers["x-filename"] ?? "upload.bin"
+    let decoded = rawHeader.removingPercentEncoding ?? rawHeader
+    let baseName = URL(fileURLWithPath: decoded).lastPathComponent
+    let sanitized = baseName
+      .replacingOccurrences(of: "/", with: "_")
+      .replacingOccurrences(of: "\\", with: "_")
+      .replacingOccurrences(of: "\0", with: "")
+    let finalName = sanitized.isEmpty || sanitized == "." || sanitized == ".." ? "upload.bin" : sanitized
+
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+      .appendingPathComponent("t3-host-window-uploads", isDirectory: true)
+    do {
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      let fileURL = dir.appendingPathComponent("\(UUID().uuidString.prefix(8))-\(finalName)")
+      try req.body.write(to: fileURL, options: .atomic)
+      InputInjector.shared.pasteFile(at: fileURL, target: target)
+      conn.sendJson(
+        UploadFileResponse(ok: true, filename: finalName, bytes: req.body.count, path: fileURL.path)
+      )
+    } catch {
+      conn.sendHttpResponse(
+        status: "500 Internal Server Error",
+        contentType: "text/plain",
+        body: Data("Failed to save uploaded file".utf8)
+      )
+    }
+  }
+
+  private func serveAudioWebSocket(conn: SocketConnection, req: HttpRequest, target: CaptureTargetKey) {
+    guard let key = req.headers["sec-websocket-key"] else {
+      conn.sendHttpResponse(status: "400 Bad Request", contentType: "text/plain", body: Data("Missing key".utf8))
+      return
+    }
+    let magic = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+    let digest = Insecure.SHA1.hash(data: Data(magic.utf8))
+    let accept = Data(digest).base64EncodedString()
+
+    let upgrade =
+      "HTTP/1.1 101 Switching Protocols\r\n"
+      + "Upgrade: websocket\r\n"
+      + "Connection: Upgrade\r\n"
+      + "Sec-WebSocket-Accept: \(accept)\r\n\r\n"
+    guard conn.writeAll(Data(upgrade.utf8)) else {
+      conn.close()
+      return
+    }
+
+    let meta = AudioMetaMessage(type: "audio-meta", sampleRate: 48000, channels: 2, format: "s16le")
+    if let metaData = try? JSONEncoder().encode(meta) {
+      _ = conn.sendWsFrame(opcode: 0x1, payload: metaData)
+    }
+
+    let session = CaptureManager.shared.session(for: target)
+    var subRef: StreamSubscriber?
+    let sub = StreamSubscriber(
+      label: "t3.audio.sub.\(target.description)",
+      maxPendingWrites: 4,
+      send: { pcm in conn.sendWsFrame(opcode: 0x2, payload: pcm) },
+      onClose: {
+        if let id = subRef?.id {
+          session.removeAudioSubscriber(id)
+        }
+        conn.close()
+      }
+    )
+    subRef = sub
+
+    Task {
+      do {
+        try await session.addAudioSubscriber(sub)
+        DispatchQueue.global().async {
+          while let msg = conn.readWsMessage() {
+            if msg.opcode == 0x8 {
+              _ = conn.sendWsFrame(opcode: 0x8, payload: Data())
+              break
+            } else if msg.opcode == 0x9 {
+              _ = conn.sendWsFrame(opcode: 0xA, payload: msg.payload)
+            }
+          }
+          sub.markClosed()
+          session.removeAudioSubscriber(sub.id)
           conn.close()
         }
       } catch {
@@ -590,20 +756,59 @@ final class WindowStreamHttpServer {
     }
     pushCursorIfChanged(true)
 
+    // Bidirectional clipboard sync: monitor macOS pasteboard changes and push new text to client.
+    var lastObservedPasteboardCount: Int = DispatchQueue.main.sync {
+      NSPasteboard.general.changeCount
+    }
+    let clipboardTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+    clipboardTimer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+    clipboardTimer.setEventHandler {
+      let snapshot: (Int, String?) = DispatchQueue.main.sync {
+        let pb = NSPasteboard.general
+        let count = pb.changeCount
+        if count == lastObservedPasteboardCount { return (count, nil) }
+        return (count, pb.string(forType: .string))
+      }
+      if snapshot.0 == lastObservedPasteboardCount { return }
+      lastObservedPasteboardCount = snapshot.0
+      if snapshot.0 == InputInjector.shared.currentInjectedPasteboardCount() { return }
+      guard let text = snapshot.1, !text.isEmpty, text.utf8.count <= 65_536 else { return }
+      if let data = try? JSONEncoder().encode(ClipboardSyncMessage(type: "clipboard", text: text)) {
+        _ = conn.sendWsFrame(opcode: 0x1, payload: data)
+      }
+    }
+    clipboardTimer.resume()
+
+    defer {
+      clipboardTimer.cancel()
+      session.removeMetaSubscriber(id: subId)
+      conn.close()
+    }
+
     let decoder = JSONDecoder()
     while let msg = conn.readWsMessage() {
       switch msg.opcode {
       case 0x1:  // Text
         if let cmd = try? decoder.decode(InputCommand.self, from: msg.payload) {
-          InputInjector.shared.handle(cmd, target: target)
-          if cmd.type == "mouse" || cmd.type == "wheel" {
-            pushCursorIfChanged(false)
+          if cmd.type == "keyframe" {
+            session.requestKeyframe()
+          } else if cmd.type == "quality" {
+            if let raw = cmd.preset, let preset = StreamQualityPreset(rawValue: raw) {
+              session.setQuality(preset)
+            }
+          } else {
+            InputInjector.shared.handle(cmd, target: target)
+            if cmd.type == "resize" {
+              DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + 0.18) {
+                session.refreshTargetDimensions()
+              }
+            } else if cmd.type == "mouse" || cmd.type == "wheel" {
+              pushCursorIfChanged(false)
+            }
           }
         }
       case 0x8:  // Close
         _ = conn.sendWsFrame(opcode: 0x8, payload: Data())
-        session.removeMetaSubscriber(id: subId)
-        conn.close()
         return
       case 0x9:  // Ping
         _ = conn.sendWsFrame(opcode: 0xA, payload: msg.payload)
@@ -611,8 +816,5 @@ final class WindowStreamHttpServer {
         break
       }
     }
-
-    session.removeMetaSubscriber(id: subId)
-    conn.close()
   }
 }

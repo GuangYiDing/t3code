@@ -63,6 +63,7 @@ import { ThreadTerminalRouteScreen } from "./features/terminal/ThreadTerminalRou
 import { DevicePreviewRouteScreen } from "./features/devices/DevicePreviewRouteScreen";
 import { BrowserPreviewRouteScreen } from "./features/browser/BrowserPreviewRouteScreen";
 import { LocalPreviewRouteScreen } from "./features/browser/LocalPreviewRouteScreen";
+import { HostWindowRouteScreen } from "./features/host-apps/HostWindowRouteScreen";
 import { GitBranchesSheet } from "./features/threads/git/GitBranchesSheet";
 import { GitCommitSheet } from "./features/threads/git/GitCommitSheet";
 import { GitConfirmSheet } from "./features/threads/git/GitConfirmSheet";
@@ -212,6 +213,7 @@ const ROUTE_TITLES: Readonly<Record<string, string>> = {
   NewTaskRepositories: msg("Repositories"),
   AddProject: msg("Add project"),
   ThreadFiles: msg("Files"),
+  ThreadHostWindow: msg("Host apps"),
   WorkflowRun: msg("Run", { $context: "noun, page title for one workflow run" }),
   SettingsLegal: msg("Legal"),
   ConnectOnboarding: msg("Set up {product}", { product: "T3 Connect" }),
@@ -747,6 +749,11 @@ const RootStackConfig = createWorkspaceStackNavigator({
     ThreadLocalPreview: createNativeStackScreen({
       screen: LocalPreviewRouteScreen,
       linking: "environments/:environmentId/local-preview",
+      options: immersiveRoute({ fullWidth: true }),
+    }),
+    ThreadHostWindow: createNativeStackScreen({
+      screen: HostWindowRouteScreen,
+      linking: "environments/:environmentId/host-apps",
       options: immersiveRoute({ fullWidth: true }),
     }),
     ThreadReview: createNativeStackScreen({

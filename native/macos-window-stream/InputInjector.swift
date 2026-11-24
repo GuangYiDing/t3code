@@ -14,6 +14,34 @@ final class InputInjector {
   private var cachedBoundsValue: (CGRect, Int32?, String?)?
   private var cachedBoundsTime: CFAbsoluteTime = 0
   private var heldButtons: Set<String> = []
+  private let clipboardLock = NSLock()
+  private var lastInjectedPasteboardCount: Int = -1
+
+  func currentInjectedPasteboardCount() -> Int {
+    clipboardLock.lock()
+    defer { clipboardLock.unlock() }
+    return lastInjectedPasteboardCount
+  }
+
+  func pasteFile(at fileURL: URL, target: CaptureTargetKey) {
+    queue.async { [weak self] in
+      guard let self, AXIsProcessTrusted() else { return }
+      let changeCount: Int = DispatchQueue.main.sync {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.writeObjects([fileURL as NSURL])
+        return pb.changeCount
+      }
+      self.clipboardLock.lock()
+      self.lastInjectedPasteboardCount = changeCount
+      self.clipboardLock.unlock()
+
+      self.focusTarget(target, force: true)
+      usleep(60_000)
+      self.postKey(keyCode: CGKeyCode(kVK_ANSI_V), isDown: true, flags: .maskCommand)
+      self.postKey(keyCode: CGKeyCode(kVK_ANSI_V), isDown: false, flags: .maskCommand)
+    }
+  }
 
   func handle(_ command: InputCommand, target: CaptureTargetKey) {
     queue.async { [weak self] in
@@ -27,6 +55,8 @@ final class InputInjector {
     switch command.type {
     case "focus":
       focusTarget(target, force: true)
+    case "resize":
+      handleResize(command, target: target)
     case "mouse":
       handleMouse(command, target: target)
     case "wheel":
@@ -40,11 +70,15 @@ final class InputInjector {
       }
     case "clipboard":
       if let text = command.text {
-        DispatchQueue.main.sync {
+        let changeCount: Int = DispatchQueue.main.sync {
           let pb = NSPasteboard.general
           pb.clearContents()
           pb.setString(text, forType: .string)
+          return pb.changeCount
         }
+        clipboardLock.lock()
+        lastInjectedPasteboardCount = changeCount
+        clipboardLock.unlock()
         if command.paste == true {
           focusTarget(target, force: true)
           postKey(keyCode: CGKeyCode(kVK_ANSI_V), isDown: true, flags: .maskCommand)
@@ -54,6 +88,61 @@ final class InputInjector {
     default:
       break
     }
+  }
+
+  private func handleResize(_ command: InputCommand, target: CaptureTargetKey) {
+    guard case .window = target,
+      let reqW = command.width,
+      let reqH = command.height,
+      reqW >= 320,
+      reqH >= 240
+    else {
+      return
+    }
+    guard let (bounds, pidOpt, titleOpt) = resolveBoundsAndPid(target, forceRefresh: true),
+      let pid = pidOpt,
+      let axWin = findBestAXWindow(pid: pid, expectedBounds: bounds, expectedTitle: titleOpt ?? "")
+    else {
+      return
+    }
+
+    let displays = activeDisplayBounds()
+    let menuBarInset: CGFloat = 30
+    let targetDisplay =
+      displays.max { a, b in
+        let interA = a.intersection(bounds)
+        let interB = b.intersection(bounds)
+        let areaA = interA.isNull ? 0 : interA.width * interA.height
+        let areaB = interB.isNull ? 0 : interB.width * interB.height
+        return areaA < areaB
+      } ?? displays.first ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+
+    let availW = max(320, targetDisplay.width)
+    let availH = max(240, targetDisplay.height - menuBarInset)
+    let ratio = Double(reqW) / Double(reqH)
+    var fittedW = min(Double(reqW), Double(availW))
+    var fittedH = fittedW / ratio
+    if fittedH > Double(availH) {
+      fittedH = Double(availH)
+      fittedW = fittedH * ratio
+    }
+    var newSize = CGSize(width: fittedW.rounded(), height: fittedH.rounded())
+    var newOrigin = CGPoint(
+      x: targetDisplay.minX + max(0, (targetDisplay.width - newSize.width) / 2).rounded(),
+      y: targetDisplay.minY + menuBarInset + max(0, (availH - newSize.height) / 2).rounded()
+    )
+
+    if let posVal = AXValueCreate(.cgPoint, &newOrigin) {
+      AXUIElementSetAttributeValue(axWin, kAXPositionAttribute as CFString, posVal)
+    }
+    if let sizeVal = AXValueCreate(.cgSize, &newSize) {
+      AXUIElementSetAttributeValue(axWin, kAXSizeAttribute as CFString, sizeVal)
+    }
+    AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
+    AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
+
+    cachedBoundsTarget = nil
+    cachedBoundsValue = nil
   }
 
   private func resolveBoundsAndPid(_ target: CaptureTargetKey, forceRefresh: Bool = false) -> (
