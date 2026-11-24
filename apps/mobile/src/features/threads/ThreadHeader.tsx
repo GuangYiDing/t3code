@@ -1,3 +1,4 @@
+import { useNavigation } from "@react-navigation/native";
 import { useGT, useMessages } from "gt-react-native";
 
 import { AppBar } from "../../components/ui/AppBar";
@@ -24,6 +25,7 @@ export function ThreadHeader(props: {
   readonly inspectorMode: ThreadInspectorMode | null;
   readonly onOpenFilesInspector: () => void;
 }) {
+  const navigation = useNavigation();
   const gt = useGT();
   const m = useMessages();
   const goBack = useWorkspaceBackNavigation();
@@ -32,18 +34,33 @@ export function ThreadHeader(props: {
   const gitMenu = useThreadGitMenuDefinition(props.gitControls);
   const terminalMenu = threadTerminalMenu(props.gitControls, m);
   const filesVisible = props.inspectorMode === "files" && panes.auxiliaryPaneVisible;
-  const actions: AppBarAction[] = props.hasThreadCwd
-    ? [
-        {
-          accessibilityLabel: filesVisible ? gt("Close files") : gt("Open files"),
-          icon: "folder",
-          selected: filesVisible,
-          disabled: !props.gitControls.canOpenFiles,
-          separateBackground: false,
-          onPress: filesVisible ? toggleAuxiliaryPane : props.onOpenFilesInspector,
-        },
-      ]
-    : [];
+  const actions: AppBarAction[] = [
+    ...(props.hasThreadCwd
+      ? [
+          {
+            accessibilityLabel: filesVisible ? gt("Close files") : gt("Open files"),
+            icon: "folder" as const,
+            selected: filesVisible,
+            disabled: !props.gitControls.canOpenFiles,
+            separateBackground: false,
+            onPress: filesVisible ? toggleAuxiliaryPane : props.onOpenFilesInspector,
+          },
+        ]
+      : []),
+    ...(props.gitControls.environmentId
+      ? [
+          {
+            accessibilityLabel: gt("Host apps"),
+            icon: "desktopcomputer" as const,
+            separateBackground: false,
+            onPress: () =>
+              navigation.navigate("ThreadHostWindow", {
+                environmentId: String(props.gitControls.environmentId),
+              }),
+          },
+        ]
+      : []),
+  ];
   const menus = [gitMenu, terminalMenu].filter((menu): menu is AppBarMenu => menu !== null);
 
   return (

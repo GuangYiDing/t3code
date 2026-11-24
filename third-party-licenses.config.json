@@ -872,6 +872,15 @@
       "name": "iobuffer",
       "license": "MIT",
       "sourceUrl": "https://github.com/image-js/iobuffer"
+    },
+    {
+      "name": "werift",
+      "license": "MIT",
+      "sourceUrl": "https://github.com/shinyoshiaki/werift-webrtc",
+      "generatedNotice": {
+        "licenseId": "MIT",
+        "copyrights": ["Copyright (c) 2020-present shinyoshiaki"]
+      }
     }
   ]
 }

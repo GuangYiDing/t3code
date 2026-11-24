@@ -36,6 +36,9 @@ const DiffPanel = lazy(() => import("../DiffPanel"));
 const DevicePanel = lazy(() =>
   import("../device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
+const HostWindowPanel = lazy(() =>
+  import("../hostWindow/HostWindowPanel").then((module) => ({ default: module.HostWindowPanel })),
+);
 const FilePreviewPanel = lazy(() => import("../files/FilePreviewPanel"));
 
 type RightPanelTerminalProps = Omit<
@@ -265,6 +268,18 @@ export function RightPanelSurfaceContent(props: {
               props.onCloseSurface(surface);
               useRightPanelStore.getState().show(threadRef);
             }}
+          />
+        </Suspense>
+      );
+    case "host-window":
+      return (
+        <Suspense fallback={null}>
+          <HostWindowPanel
+            mode="embedded"
+            threadRef={threadRef}
+            key={surface.id}
+            surface={surface}
+            visible={visible}
           />
         </Suspense>
       );

@@ -366,6 +366,13 @@ import {
   DeviceShutdownInput,
 } from "./device.ts";
 import {
+  HostWindowError,
+  HostWindowListInput,
+  HostWindowListResult,
+  HostWindowPermissions,
+  HostWindowRequestPermissionsInput,
+} from "./hostWindow.ts";
+import {
   ServerConfigStreamEvent,
   DesktopUpdateCommitInput,
   OtlpEndpointCheckInput,
@@ -579,6 +586,9 @@ export const WS_METHODS = {
   deviceShutdown: "device.shutdown",
   deviceDetail: "device.detail",
   deviceAction: "device.action",
+
+  hostWindowList: "hostWindow.list",
+  hostWindowRequestPermissions: "hostWindow.requestPermissions",
 
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
@@ -2098,6 +2108,18 @@ const WsSubscribeDeviceStateRpc = Rpc.make(WS_METHODS.subscribeDeviceState, {
   stream: true,
 });
 
+const WsHostWindowListRpc = Rpc.make(WS_METHODS.hostWindowList, {
+  payload: HostWindowListInput,
+  success: HostWindowListResult,
+  error: Schema.Union([HostWindowError, EnvironmentAuthorizationError]),
+});
+
+const WsHostWindowRequestPermissionsRpc = Rpc.make(WS_METHODS.hostWindowRequestPermissions, {
+  payload: HostWindowRequestPermissionsInput,
+  success: HostWindowPermissions,
+  error: Schema.Union([HostWindowError, EnvironmentAuthorizationError]),
+});
+
 const WsOrchestrationV2DispatchCommandRpc = Rpc.make(ORCHESTRATION_V2_WS_METHODS.dispatchCommand, {
   payload: OrchestrationV2RpcSchemas.dispatchCommand.input,
   success: OrchestrationV2RpcSchemas.dispatchCommand.output,
@@ -2689,6 +2711,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsDeviceDetailRpc,
   WsDeviceActionRpc,
   WsSubscribeDeviceStateRpc,
+  WsHostWindowListRpc,
+  WsHostWindowRequestPermissionsRpc,
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,

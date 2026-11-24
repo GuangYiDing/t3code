@@ -18,6 +18,7 @@ const licenseGeneratorSource = path.join(
 const escapedWorkspaceRoot = workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const generatedDeviceStreamRoot = path.join(__dirname, ".generated", "device-stream");
 const generatedPreviewStreamRoot = path.join(__dirname, ".generated", "preview-stream");
+const generatedHostWindowStreamRoot = path.join(__dirname, ".generated", "host-window-stream");
 
 config.watchFolders = [...new Set([...(config.watchFolders ?? []), workspaceRoot])];
 config.resolver = {
@@ -35,6 +36,7 @@ config.resolver = {
     "@t3tools/mobile-third-party-licenses": generatedLicenseModuleRoot,
     "@t3tools/mobile-device-stream": generatedDeviceStreamRoot,
     "@t3tools/mobile-preview-stream": generatedPreviewStreamRoot,
+    "@t3tools/mobile-host-window-stream": generatedHostWindowStreamRoot,
   },
 };
 
@@ -71,11 +73,19 @@ async function generateMobileThirdPartyLicenses() {
 }
 
 async function prepareStreamScripts() {
-  const { generateDeviceStreamScript, generatePreviewStreamScript } = await import(
+  const {
+    generateDeviceStreamScript,
+    generatePreviewStreamScript,
+    generateHostWindowStreamScript,
+  } = await import(
     pathToFileURL(path.join(__dirname, "scripts", "generate-device-stream.mts")).href
   );
   const generateAll = () =>
-    Promise.all([generateDeviceStreamScript(), generatePreviewStreamScript()]);
+    Promise.all([
+      generateDeviceStreamScript(),
+      generatePreviewStreamScript(),
+      generateHostWindowStreamScript(),
+    ]);
   await generateAll();
   if (process.env.NODE_ENV !== "production") {
     let rebuild = Promise.resolve();
@@ -90,7 +100,13 @@ async function prepareStreamScripts() {
         ["preview-stream.browser.ts"],
         generatePreviewStreamScript,
       ],
+      [
+        "apps/mobile/src/features/host-apps",
+        ["host-window-stream.browser.ts"],
+        generateHostWindowStreamScript,
+      ],
       ["packages/client-runtime/src/device", ["stream.ts", "hubAccess.ts"], generateAll],
+      ["packages/client-runtime/src/hostWindow", ["stream.ts"], generateHostWindowStreamScript],
       [
         "packages/client-runtime/src/preview",
         ["serverBrowserStream.ts"],

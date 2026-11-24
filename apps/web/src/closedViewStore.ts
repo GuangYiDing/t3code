@@ -84,6 +84,16 @@ const isClosedViewEntry = (entry: unknown): entry is ClosedViewEntry => {
             typeof surface.target.name === "string" &&
             (surface.target.platform === "ios" || surface.target.platform === "android")))
       );
+    case "host-window":
+      return (
+        (surface.title === undefined || typeof surface.title === "string") &&
+        (surface.target === undefined ||
+          (surface.target !== null &&
+            (surface.target.kind === "window" || surface.target.kind === "display") &&
+            Number.isSafeInteger(surface.target.id) &&
+            typeof surface.target.appName === "string" &&
+            typeof surface.target.title === "string"))
+      );
     case "thread":
       return typeof surface.threadId === "string" && surface.id === `thread:${surface.threadId}`;
     case "linked-thread":

@@ -79,6 +79,14 @@
       "types": "./src/device/hubAccess.ts",
       "default": "./src/device/hubAccess.ts"
     },
+    "./host-window/stream": {
+      "types": "./src/hostWindow/stream.ts",
+      "default": "./src/hostWindow/stream.ts"
+    },
+    "./state/host-window": {
+      "types": "./src/state/hostWindow.ts",
+      "default": "./src/state/hostWindow.ts"
+    },
     "./preview/server-browser-stream": {
       "types": "./src/preview/serverBrowserStream.ts",
       "default": "./src/preview/serverBrowserStream.ts"

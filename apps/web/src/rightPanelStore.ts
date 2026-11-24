@@ -26,6 +26,7 @@ const RIGHT_PANEL_KINDS = [
   "file",
   "preview",
   "device",
+  "host-window",
   "terminal",
   "pull-request",
   "pull-requests",
@@ -44,10 +45,23 @@ export interface DeviceTabTarget {
   name: string;
 }
 
+export interface HostWindowTabTarget {
+  kind: "window" | "display";
+  id: number;
+  appName: string;
+  title: string;
+}
+
 export type RightPanelSurface =
   | { id: `browser:${string}`; kind: "preview"; resourceId: string }
   | { id: "browser:new"; kind: "preview"; resourceId: null }
   | { id: "device" | `device:${string}`; kind: "device"; target?: DeviceTabTarget; title?: string }
+  | {
+      id: "host-window" | `host-window:${string}`;
+      kind: "host-window";
+      target?: HostWindowTabTarget;
+      title?: string;
+    }
   | {
       id: `terminal:${string}`;
       kind: "terminal";
@@ -196,6 +210,7 @@ interface RightPanelStoreState {
   /** Records the title the linked environment gave, so the tab and a reopened one show it. */
   setLinkedThreadTitle: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
+  openHostWindow: (ref: ScopedThreadRef, target: HostWindowTabTarget) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
   openFile: (ref: ScopedThreadRef, relativePath: string, line?: number) => void;
@@ -299,6 +314,8 @@ const singletonSurface = (
       return { id: "pull-requests", kind };
     case "device":
       return { id: "device", kind };
+    case "host-window":
+      return { id: "host-window", kind };
   }
 };
 
@@ -870,6 +887,18 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               },
               existing ?? surface,
             );
+          }),
+        ),
+      openHostWindow: (ref, target) =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) => {
+            const id = `host-window:${target.kind}:${target.id}` as const;
+            const surface: RightPanelSurface = { id, kind: "host-window", target };
+            const existing = current.surfaces.find((entry) => entry.id === id);
+            const surfaces = existing
+              ? current.surfaces.filter((entry) => entry.id !== "host-window")
+              : current.surfaces.map((entry) => (entry.id === "host-window" ? surface : entry));
+            return upsertSurface({ ...current, surfaces }, existing ?? surface);
           }),
         ),
       openThread: (ref, threadId) =>
