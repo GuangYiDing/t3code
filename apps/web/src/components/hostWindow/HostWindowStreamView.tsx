@@ -1055,12 +1055,12 @@ export function HostWindowStreamView(props: {
     sendShortcut("KeyV", 4);
   };
 
-  const resolutionLabel =
-    stats && stats.width > 0 && stats.height > 0
-      ? `${stats.width}×${stats.height}`
-      : screen
-        ? `${screen.width}×${screen.height}`
-        : null;
+  const mediaWidth =
+    stats && stats.width > 0 ? stats.width : screen && screen.width > 0 ? screen.width : 0;
+  const mediaHeight =
+    stats && stats.height > 0 ? stats.height : screen && screen.height > 0 ? screen.height : 0;
+  const resolutionLabel = mediaWidth > 0 && mediaHeight > 0 ? `${mediaWidth}×${mediaHeight}` : null;
+  const mediaAspectRatio = mediaWidth > 0 && mediaHeight > 0 ? mediaWidth / mediaHeight : null;
 
   const showVirtualCursor =
     touchDevice && touchMode === "trackpad" && lastInputKind === "touch" && status === "streaming";
@@ -1214,8 +1214,8 @@ export function HostWindowStreamView(props: {
       <div
         ref={stageRef}
         tabIndex={0}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/95 p-1 outline-none select-none"
-        style={{ touchAction: "none" }}
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/95 outline-none select-none"
+        style={{ touchAction: "none", containerType: "size" }}
         onContextMenu={(event) => event.preventDefault()}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
@@ -1237,8 +1237,16 @@ export function HostWindowStreamView(props: {
         ) : null}
 
         <div
-          className="relative flex max-h-full max-w-full items-center justify-center"
+          className="relative flex shrink-0 items-center justify-center"
           style={{
+            width:
+              mediaAspectRatio !== null
+                ? `min(100cqw, calc(100cqh * ${mediaAspectRatio}))`
+                : "100%",
+            height:
+              mediaAspectRatio !== null
+                ? `min(100cqh, calc(100cqw / ${mediaAspectRatio}))`
+                : "100%",
             transform: `translate3d(${viewport.panX}px, ${viewport.panY}px, 0) scale(${viewport.zoom})`,
             transformOrigin: "center center",
             willChange: isZoomed ? "transform" : undefined,
@@ -1247,11 +1255,9 @@ export function HostWindowStreamView(props: {
           <canvas
             ref={canvasRef}
             tabIndex={-1}
-            className="max-h-full max-w-full rounded-sm shadow-lg outline-none select-none"
+            className="size-full rounded-sm shadow-lg outline-none select-none"
             style={{
               display: mjpegMode ? "none" : "block",
-              width: "auto",
-              height: "auto",
               cursor: cssCursor,
             }}
           />
@@ -1260,11 +1266,9 @@ export function HostWindowStreamView(props: {
             ref={mjpegRef}
             alt={props.target.title}
             draggable={false}
-            className="max-h-full max-w-full rounded-sm shadow-lg outline-none select-none"
+            className="size-full rounded-sm object-contain shadow-lg outline-none select-none"
             style={{
               display: mjpegMode ? "block" : "none",
-              width: "auto",
-              height: "auto",
               cursor: cssCursor,
             }}
           />
