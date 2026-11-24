@@ -386,9 +386,15 @@ final class CaptureSession: NSObject, SCStreamOutput, SCStreamDelegate, @uncheck
       if needSeed || (now - lastMjpegTime >= 1.0 / 24.0) {
         lastMjpegTime = now
         if let jpeg = H264Encoder.encodeJpeg(pixelBuffer: pixelBuffer, quality: 0.70) {
-          lock.lock()
-          latestSeedJpeg = jpeg
-          lock.unlock()
+          let seedSubs: [StreamSubscriber] = lock.withLock {
+            let wasNil = (latestSeedJpeg == nil)
+            latestSeedJpeg = jpeg
+            return wasNil ? Array(avccSubscribers.values) : []
+          }
+          if !seedSubs.isEmpty {
+            let seedPacket = AvccWire.pack(tag: .seed, payload: jpeg)
+            for sub in seedSubs { sub.enqueue(seedPacket, droppable: true) }
+          }
           if !mjpegSubs.isEmpty {
             let part = Self.mjpegPart(jpeg)
             for sub in mjpegSubs { sub.enqueue(part, droppable: true) }

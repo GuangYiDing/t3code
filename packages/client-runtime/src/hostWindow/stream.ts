@@ -76,6 +76,7 @@ export interface HostWindowStreamClient {
 }
 
 const RETRY_DELAY_MS = 1_200;
+const FIRST_FRAME_TIMEOUT_MS = 10_000;
 const FRAME_DURATION_US = 16_667;
 const SOFT_DECODE_QUEUE = 8;
 
@@ -120,6 +121,7 @@ export function createHostWindowStreamClient(
   let socket: WebSocket | null = null;
   let videoRetry: ReturnType<typeof setTimeout> | null = null;
   let inputRetry: ReturnType<typeof setTimeout> | null = null;
+  let firstFrameTimer: ReturnType<typeof setTimeout> | null = null;
   let statsTimer: ReturnType<typeof setInterval> | null = null;
   let mjpegMode = false;
   let mjpegImage: HTMLImageElement | null = null;
@@ -139,9 +141,15 @@ export function createHostWindowStreamClient(
     awaitingKey = true;
   };
 
+  const clearFirstFrameTimer = () => {
+    if (firstFrameTimer !== null) clearTimeout(firstFrameTimer);
+    firstFrameTimer = null;
+  };
+
   const markStreaming = () => {
     if (!hasFrame && !stopped) {
       hasFrame = true;
+      clearFirstFrameTimer();
       events.onStatus("streaming");
     }
   };
@@ -364,6 +372,7 @@ export function createHostWindowStreamClient(
     mjpegMode = false;
     if (videoRetry !== null) clearTimeout(videoRetry);
     if (inputRetry !== null) clearTimeout(inputRetry);
+    clearFirstFrameTimer();
     if (statsTimer !== null) clearInterval(statsTimer);
     videoRetry = null;
     inputRetry = null;
@@ -385,6 +394,13 @@ export function createHostWindowStreamClient(
     framesSinceTick = 0;
     bytesSinceTick = 0;
     events.onStatus("connecting");
+    firstFrameTimer = setTimeout(() => {
+      if (stopped || hasFrame) return;
+      events.onStatus(
+        "error",
+        "No video received from this window. Make sure it is visible (not minimized) or pick another window.",
+      );
+    }, FIRST_FRAME_TIMEOUT_MS);
     statsTimer = setInterval(() => {
       if (stopped) return;
       const now = performance.now();

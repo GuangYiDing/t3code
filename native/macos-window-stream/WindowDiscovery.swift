@@ -31,9 +31,11 @@ final class WindowDiscovery {
     }
 
     do {
+      // Only include on-screen windows: hidden off-screen macOS helper windows (e.g. invisible popovers)
+      // never emit frames in ScreenCaptureKit.
       let content = try await SCShareableContent.excludingDesktopWindows(
         false,
-        onScreenWindowsOnly: false
+        onScreenWindowsOnly: true
       )
       let onScreenOrder = currentOnScreenWindowOrder()
       let selfPid = getpid()
@@ -49,6 +51,7 @@ final class WindowDiscovery {
       var windows: [WindowSummary] = []
       for w in content.windows {
         guard w.windowLayer == 0 else { continue }
+        guard w.isOnScreen else { continue }
         guard w.frame.width >= 120, w.frame.height >= 80 else { continue }
         guard let app = w.owningApplication else { continue }
         guard app.processID != selfPid else { continue }
