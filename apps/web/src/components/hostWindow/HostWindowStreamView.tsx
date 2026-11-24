@@ -11,7 +11,17 @@ import {
 } from "@t3tools/client-runtime/host-window/stream";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { T, useGT, Var } from "gt-react";
-import { ClipboardPaste, CornerDownLeft, Focus, Layers, Monitor, RefreshCw } from "lucide-react";
+import {
+  ClipboardPaste,
+  CornerDownLeft,
+  Focus,
+  Hand,
+  Keyboard,
+  Layers,
+  Monitor,
+  MousePointerClick,
+  RefreshCw,
+} from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
@@ -22,6 +32,42 @@ import { refreshHostWindowAccess } from "~/state/hostWindow";
 const mouseButtonName = (button: number): HostWindowMouseButton =>
   button === 2 ? "right" : button === 1 ? "middle" : "left";
 
+const isTouchFirstDevice = (): boolean => {
+  if (typeof window === "undefined") return false;
+  if (window.matchMedia?.("(pointer: coarse)").matches) return true;
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+};
+
+const normalizeWheelDelta = (delta: number, deltaMode: number): number => {
+  if (deltaMode === 1) return delta * 32; // DOM_DELTA_LINE
+  if (deltaMode === 2) return delta * 400; // DOM_DELTA_PAGE
+  return delta; // DOM_DELTA_PIXEL
+};
+
+const normalizedPoint = (el: HTMLElement, clientX: number, clientY: number) => {
+  const rect = el.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  return {
+    x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+    y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)),
+  };
+};
+
+const TOUCH_DRAG_THRESHOLD_PX = 10;
+const TOUCH_LONG_PRESS_MS = 500;
+const TOUCH_SCROLL_MULTIPLIER = 1.4;
+
+type TouchGestureState = {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  startTime: number;
+  mode: "pending" | "scrolling" | "dragging" | "long-pressed";
+  longPressTimer: ReturnType<typeof setTimeout> | null;
+};
+
 export function HostWindowStreamView(props: {
   readonly environmentId: EnvironmentId;
   readonly target: HostWindowTabTarget;
@@ -30,6 +76,7 @@ export function HostWindowStreamView(props: {
   readonly onSwitchWindow: () => void;
 }) {
   const gt = useGT();
+  const stageRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const mjpegRef = useRef<HTMLImageElement | null>(null);
   const imeInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -52,6 +99,7 @@ export function HostWindowStreamView(props: {
     modifiers: number;
   } | null>(null);
   const wheelRafRef = useRef<number | null>(null);
+  const touchGestureRef = useRef<TouchGestureState | null>(null);
 
   const [status, setStatus] = useState<HostWindowStreamStatus>("connecting");
   const [statusDetail, setStatusDetail] = useState<string | null>(null);
@@ -60,6 +108,9 @@ export function HostWindowStreamView(props: {
   const [inputConnected, setInputConnected] = useState(false);
   const [screen, setScreen] = useState<HostWindowScreenMeta | null>(null);
   const [stats, setStats] = useState<HostWindowStreamStats | null>(null);
+  const [touchDevice] = useState(() => isTouchFirstDevice());
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const [touchMode, setTouchMode] = useState<"scroll" | "drag">("scroll");
 
   // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- manages WebCodecs/WebSocket host window stream lifecycle while mounted and visible.
   useEffect(() => {
@@ -98,6 +149,10 @@ export function HostWindowStreamView(props: {
     return () => {
       if (moveRafRef.current !== null) cancelAnimationFrame(moveRafRef.current);
       if (wheelRafRef.current !== null) cancelAnimationFrame(wheelRafRef.current);
+      if (touchGestureRef.current?.longPressTimer) {
+        clearTimeout(touchGestureRef.current.longPressTimer);
+      }
+      touchGestureRef.current = null;
       moveRafRef.current = null;
       wheelRafRef.current = null;
       pendingMoveRef.current = null;
@@ -118,31 +173,159 @@ export function HostWindowStreamView(props: {
     clientRef.current?.sendInput(command);
   };
 
-  const normalizedPoint = (el: HTMLElement, clientX: number, clientY: number) => {
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-    return {
-      x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
-      y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height)),
+  const queueWheel = (x: number, y: number, deltaX: number, deltaY: number, modifiers: number) => {
+    const prev = pendingWheelRef.current;
+    pendingWheelRef.current = {
+      x,
+      y,
+      deltaX: (prev?.deltaX ?? 0) + deltaX,
+      deltaY: (prev?.deltaY ?? 0) + deltaY,
+      modifiers,
     };
+    if (wheelRafRef.current === null) {
+      wheelRafRef.current = requestAnimationFrame(() => {
+        wheelRafRef.current = null;
+        const wheel = pendingWheelRef.current;
+        pendingWheelRef.current = null;
+        if (wheel) clientRef.current?.sendInput({ type: "wheel", ...wheel });
+      });
+    }
   };
 
-  const handlePointerDown = (event: React.PointerEvent<HTMLElement>) => {
-    event.preventDefault();
-    imeInputRef.current?.focus({ preventScroll: true });
-    event.currentTarget.setPointerCapture(event.pointerId);
-    const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
-    if (!point) return;
-    const button = mouseButtonName(event.button);
+  // oxlint-disable-next-line t3code/no-unreasoned-state-sync -- attaches a native non-passive wheel listener to the stage DOM node so preventDefault stops browser scrolling.
+  useEffect(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onNativeWheel = (event: WheelEvent) => {
+      const mediaEl = mjpegMode ? mjpegRef.current : canvasRef.current;
+      if (!mediaEl) return;
+      const point = normalizedPoint(mediaEl, event.clientX, event.clientY);
+      if (!point) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const dx = normalizeWheelDelta(event.deltaX, event.deltaMode);
+      const dy = normalizeWheelDelta(event.deltaY, event.deltaMode);
+      if (dx === 0 && dy === 0) return;
+      const prev = pendingWheelRef.current;
+      pendingWheelRef.current = {
+        x: point.x,
+        y: point.y,
+        deltaX: (prev?.deltaX ?? 0) + dx,
+        deltaY: (prev?.deltaY ?? 0) + dy,
+        modifiers: hostWindowModifiers(event),
+      };
+      if (wheelRafRef.current === null) {
+        wheelRafRef.current = requestAnimationFrame(() => {
+          wheelRafRef.current = null;
+          const wheel = pendingWheelRef.current;
+          pendingWheelRef.current = null;
+          if (wheel) clientRef.current?.sendInput({ type: "wheel", ...wheel });
+        });
+      }
+    };
+    stage.addEventListener("wheel", onNativeWheel, { passive: false });
+    return () => {
+      stage.removeEventListener("wheel", onNativeWheel);
+    };
+  }, [mjpegMode]);
+
+  const computeClickCount = (
+    clientX: number,
+    clientY: number,
+    button: HostWindowMouseButton,
+    maxDistance: number,
+  ): number => {
     const now = performance.now();
     const prev = lastClickRef.current;
     const count =
       prev.button === button &&
       now - prev.ts < 450 &&
-      Math.hypot(event.clientX - prev.x, event.clientY - prev.y) < 6
+      Math.hypot(clientX - prev.x, clientY - prev.y) < maxDistance
         ? prev.count + 1
         : 1;
-    lastClickRef.current = { ts: now, x: event.clientX, y: event.clientY, count, button };
+    lastClickRef.current = { ts: now, x: clientX, y: clientY, count, button };
+    return count;
+  };
+
+  const focusForPointer = (pointerType: string) => {
+    if (!touchDevice && pointerType === "mouse") {
+      // Desktop mouse click: focus hidden IME textarea for zero-friction typing & CJK IME.
+      imeInputRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    // Tablet / mobile / touch: never auto-focus <textarea>, otherwise Android/iOS pops up the
+    // virtual keyboard on every click. Focus the non-editable stage so physical/Bluetooth
+    // keyboards still work without opening the soft keyboard.
+    if (!keyboardOpen) {
+      stageRef.current?.focus({ preventScroll: true });
+    }
+  };
+
+  const clearTouchTimer = (gesture: TouchGestureState | null) => {
+    if (gesture?.longPressTimer) {
+      clearTimeout(gesture.longPressTimer);
+      gesture.longPressTimer = null;
+    }
+  };
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLElement>) => {
+    event.preventDefault();
+    focusForPointer(event.pointerType);
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {}
+    const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
+    if (!point) return;
+
+    if (event.pointerType === "touch" && touchMode === "scroll") {
+      clearTouchTimer(touchGestureRef.current);
+      const targetEl = event.currentTarget;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const modifiers = hostWindowModifiers(event);
+      const gesture: TouchGestureState = {
+        pointerId: event.pointerId,
+        startX,
+        startY,
+        lastX: startX,
+        lastY: startY,
+        startTime: performance.now(),
+        mode: "pending",
+        longPressTimer: setTimeout(() => {
+          const current = touchGestureRef.current;
+          if (!current || current.pointerId !== event.pointerId || current.mode !== "pending") {
+            return;
+          }
+          current.mode = "long-pressed";
+          current.longPressTimer = null;
+          const pt = normalizedPoint(targetEl, current.startX, current.startY);
+          if (!pt) return;
+          sendInput({
+            type: "mouse",
+            action: "down",
+            x: pt.x,
+            y: pt.y,
+            button: "right",
+            clickCount: 1,
+            modifiers,
+          });
+          sendInput({
+            type: "mouse",
+            action: "up",
+            x: pt.x,
+            y: pt.y,
+            button: "right",
+            clickCount: 1,
+            modifiers,
+          });
+        }, TOUCH_LONG_PRESS_MS),
+      };
+      touchGestureRef.current = gesture;
+      return;
+    }
+
+    const button = mouseButtonName(event.button);
+    const count = computeClickCount(event.clientX, event.clientY, button, 6);
     sendInput({
       type: "mouse",
       action: "down",
@@ -155,6 +338,28 @@ export function HostWindowStreamView(props: {
   };
 
   const handlePointerMove = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.pointerType === "touch" && touchMode === "scroll") {
+      const gesture = touchGestureRef.current;
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
+      if (gesture.mode === "long-pressed") return;
+      const totalDist = Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY);
+      if (gesture.mode === "pending" && totalDist >= TOUCH_DRAG_THRESHOLD_PX) {
+        clearTouchTimer(gesture);
+        gesture.mode = "scrolling";
+      }
+      if (gesture.mode === "scrolling") {
+        const dx = (gesture.lastX - event.clientX) * TOUCH_SCROLL_MULTIPLIER;
+        const dy = (gesture.lastY - event.clientY) * TOUCH_SCROLL_MULTIPLIER;
+        gesture.lastX = event.clientX;
+        gesture.lastY = event.clientY;
+        const anchor = normalizedPoint(event.currentTarget, gesture.startX, gesture.startY);
+        if (anchor && (dx !== 0 || dy !== 0)) {
+          queueWheel(anchor.x, anchor.y, dx, dy, hostWindowModifiers(event));
+        }
+      }
+      return;
+    }
+
     const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
     if (!point) return;
     const button: HostWindowMouseButton =
@@ -184,6 +389,44 @@ export function HostWindowStreamView(props: {
   };
 
   const handlePointerUp = (event: React.PointerEvent<HTMLElement>) => {
+    try {
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+    } catch {}
+
+    if (event.pointerType === "touch" && touchMode === "scroll") {
+      const gesture = touchGestureRef.current;
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
+      clearTouchTimer(gesture);
+      touchGestureRef.current = null;
+      if (gesture.mode === "pending" && event.type === "pointerup") {
+        const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
+        if (!point) return;
+        const count = computeClickCount(event.clientX, event.clientY, "left", 24);
+        const modifiers = hostWindowModifiers(event);
+        sendInput({
+          type: "mouse",
+          action: "down",
+          x: point.x,
+          y: point.y,
+          button: "left",
+          clickCount: count,
+          modifiers,
+        });
+        sendInput({
+          type: "mouse",
+          action: "up",
+          x: point.x,
+          y: point.y,
+          button: "left",
+          clickCount: count,
+          modifiers,
+        });
+      }
+      return;
+    }
+
     const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
     if (!point) return;
     sendInput({
@@ -197,30 +440,50 @@ export function HostWindowStreamView(props: {
     });
   };
 
-  const handleWheel = (event: React.WheelEvent<HTMLElement>) => {
-    const point = normalizedPoint(event.currentTarget, event.clientX, event.clientY);
-    if (!point) return;
-    const prev = pendingWheelRef.current;
-    pendingWheelRef.current = {
-      x: point.x,
-      y: point.y,
-      deltaX: (prev?.deltaX ?? 0) + event.deltaX,
-      deltaY: (prev?.deltaY ?? 0) + event.deltaY,
-      modifiers: hostWindowModifiers(event),
-    };
-    if (wheelRafRef.current === null) {
-      wheelRafRef.current = requestAnimationFrame(() => {
-        wheelRafRef.current = null;
-        const wheel = pendingWheelRef.current;
-        pendingWheelRef.current = null;
-        if (wheel) sendInput({ type: "wheel", ...wheel });
-      });
-    }
-  };
-
   const sendShortcut = (code: string, modifiers: number) => {
     sendInput({ type: "key", action: "down", code, modifiers });
     sendInput({ type: "key", action: "up", code, modifiers });
+  };
+
+  const toggleSoftKeyboard = () => {
+    if (keyboardOpen) {
+      setKeyboardOpen(false);
+      imeInputRef.current?.blur();
+      stageRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    setKeyboardOpen(true);
+    imeInputRef.current?.focus({ preventScroll: true });
+  };
+
+  const handleHardwareKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.target === imeInputRef.current) return;
+    if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
+      return;
+    }
+    event.preventDefault();
+    sendInput({
+      type: "key",
+      action: "down",
+      key: event.key,
+      code: event.code,
+      modifiers: hostWindowModifiers(event),
+    });
+  };
+
+  const handleHardwareKeyUp = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.target === imeInputRef.current) return;
+    if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
+      return;
+    }
+    event.preventDefault();
+    sendInput({
+      type: "key",
+      action: "up",
+      key: event.key,
+      code: event.code,
+      modifiers: hostWindowModifiers(event),
+    });
   };
 
   const handlePasteClipboard = async () => {
@@ -270,6 +533,32 @@ export function HostWindowStreamView(props: {
           ) : null}
         </div>
         <div className="flex shrink-0 items-center gap-1">
+          <Button
+            size="xs"
+            variant={keyboardOpen ? "secondary" : "ghost"}
+            title={keyboardOpen ? gt("Hide keyboard") : gt("Show keyboard")}
+            onClick={toggleSoftKeyboard}
+          >
+            <Keyboard className="size-3.5" />
+          </Button>
+          {touchDevice ? (
+            <Button
+              size="xs"
+              variant={touchMode === "drag" ? "secondary" : "ghost"}
+              title={
+                touchMode === "scroll"
+                  ? gt("Touch: Scroll (tap to switch to drag)")
+                  : gt("Touch: Drag (tap to switch to scroll)")
+              }
+              onClick={() => setTouchMode((prev) => (prev === "scroll" ? "drag" : "scroll"))}
+            >
+              {touchMode === "scroll" ? (
+                <Hand className="size-3.5" />
+              ) : (
+                <MousePointerClick className="size-3.5" />
+              )}
+            </Button>
+          ) : null}
           <Button
             size="xs"
             variant="ghost"
@@ -325,7 +614,13 @@ export function HostWindowStreamView(props: {
         </div>
       </div>
 
-      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/95 p-1">
+      <div
+        ref={stageRef}
+        tabIndex={0}
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden bg-black/95 p-1 outline-none"
+        onKeyDown={handleHardwareKeyDown}
+        onKeyUp={handleHardwareKeyUp}
+      >
         {status !== "streaming" ? (
           <div className="pointer-events-none absolute inset-0 z-10 flex flex-col items-center justify-center gap-2 bg-background/80 text-xs text-muted-foreground">
             {status === "connecting" ? <Spinner className="size-4" /> : null}
@@ -340,7 +635,7 @@ export function HostWindowStreamView(props: {
 
         <canvas
           ref={canvasRef}
-          tabIndex={0}
+          tabIndex={-1}
           className="max-h-full max-w-full cursor-default rounded-sm shadow-lg outline-none select-none"
           style={{
             display: mjpegMode ? "none" : "block",
@@ -353,7 +648,6 @@ export function HostWindowStreamView(props: {
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          onWheel={handleWheel}
         />
 
         <img
@@ -372,7 +666,6 @@ export function HostWindowStreamView(props: {
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          onWheel={handleWheel}
         />
 
         <textarea
@@ -383,6 +676,7 @@ export function HostWindowStreamView(props: {
           autoCorrect="off"
           spellCheck={false}
           className="pointer-events-none fixed -left-[9999px] size-px opacity-0"
+          onBlur={() => setKeyboardOpen(false)}
           onCompositionStart={() => {
             composingRef.current = true;
           }}
@@ -391,8 +685,45 @@ export function HostWindowStreamView(props: {
             if (event.data) sendInput({ type: "text", text: event.data });
             event.currentTarget.value = "";
           }}
+          onBeforeInput={(event) => {
+            if (composingRef.current) return;
+            const nativeEvent = event.nativeEvent as InputEvent;
+            const inputType = nativeEvent.inputType;
+            if (inputType === "insertLineBreak" || inputType === "insertParagraph") {
+              event.preventDefault();
+              sendShortcut("Enter", 0);
+              return;
+            }
+            if (inputType === "deleteContentBackward") {
+              event.preventDefault();
+              sendShortcut("Backspace", 0);
+              return;
+            }
+            if (inputType === "deleteContentForward") {
+              event.preventDefault();
+              sendShortcut("Delete", 0);
+              return;
+            }
+            if (inputType === "insertText" && nativeEvent.data) {
+              event.preventDefault();
+              sendInput({ type: "text", text: nativeEvent.data });
+            }
+          }}
+          onInput={(event) => {
+            if (composingRef.current) return;
+            const val = event.currentTarget.value;
+            if (val) {
+              sendInput({ type: "text", text: val });
+              event.currentTarget.value = "";
+            }
+          }}
           onKeyDown={(event) => {
-            if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
+            if (
+              composingRef.current ||
+              event.nativeEvent.isComposing ||
+              event.keyCode === 229 ||
+              event.key === "Unidentified"
+            ) {
               return;
             }
             event.preventDefault();
@@ -405,7 +736,12 @@ export function HostWindowStreamView(props: {
             });
           }}
           onKeyUp={(event) => {
-            if (composingRef.current || event.nativeEvent.isComposing || event.keyCode === 229) {
+            if (
+              composingRef.current ||
+              event.nativeEvent.isComposing ||
+              event.keyCode === 229 ||
+              event.key === "Unidentified"
+            ) {
               return;
             }
             event.preventDefault();

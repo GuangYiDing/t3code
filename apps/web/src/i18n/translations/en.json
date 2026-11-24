@@ -5921,6 +5921,10 @@
     },
     ")"
   ],
+  "b618c1d3b36a3891": "Hide keyboard",
+  "5a98a14713859be8": "Show keyboard",
+  "0be1e62227962c18": "Touch: Scroll (tap to switch to drag)",
+  "f096297d9a6da830": "Touch: Drag (tap to switch to scroll)",
   "0350c6da27068d88": "Focus window on host",
   "3d298f5499039f24": "Send ⌘L (Address bar)",
   "a6282149ce95c4c1": "Reload (⌘R)",

@@ -93,43 +93,89 @@ final class InputInjector {
     )
   }
 
-  private func focusTarget(_ target: CaptureTargetKey, force: Bool) {
-    guard case .window(let windowId) = target else { return }
-    guard let (bounds, pidOpt, titleOpt) = resolveBoundsAndPid(target, forceRefresh: force),
-      let pid = pidOpt
-    else {
-      return
-    }
-    let now = CFAbsoluteTimeGetCurrent()
-    if !force {
-      if lastFocusPid == pid && lastFocusWindowId == windowId && (now - lastFocusTime) < 1.5 {
-        return
-      }
-      if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
-        && lastFocusWindowId == windowId
-      {
-        lastFocusTime = now
-        return
-      }
-    }
-    lastFocusPid = pid
-    lastFocusWindowId = windowId
-    lastFocusTime = now
-
-    if let app = NSRunningApplication(processIdentifier: pid) {
-      app.activate()
-    }
-    raiseWindowViaAX(pid: pid, expectedBounds: bounds, expectedTitle: titleOpt ?? "")
+  private func activeDisplayBounds() -> [CGRect] {
+    var count: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &count)
+    guard count > 0 else { return [] }
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    CGGetActiveDisplayList(count, &ids, &count)
+    return ids.prefix(Int(count)).map { CGDisplayBounds($0) }
   }
 
-  private func raiseWindowViaAX(pid: Int32, expectedBounds: CGRect, expectedTitle: String) {
+  private func isPointOnAnyDisplay(_ pt: CGPoint, displays: [CGRect]) -> Bool {
+    return displays.contains { rect in
+      pt.x >= rect.minX && pt.x < rect.maxX && pt.y >= rect.minY && pt.y < rect.maxY
+    }
+  }
+
+  /// If a remote-controlled window was dragged mostly off-screen so the interaction point falls
+  /// outside every active display, macOS drops or clamps synthetic CGEvents. Nudge the window
+  /// back into the nearest display so clicks and scrolls land on real screen pixels.
+  private func ensureTargetPointOnScreen(
+    _ target: CaptureTargetKey,
+    nx: Double,
+    ny: Double,
+    bounds: CGRect,
+    pid: Int32?,
+    title: String?
+  ) -> CGPoint {
+    let pt = screenPoint(nx: nx, ny: ny, bounds: bounds)
+    guard case .window = target, let pid else { return pt }
+    let displays = activeDisplayBounds()
+    guard !displays.isEmpty, !isPointOnAnyDisplay(pt, displays: displays) else {
+      return pt
+    }
+
+    // Pick the display with the largest intersection, or nearest center if completely off-screen.
+    let winCenter = CGPoint(x: bounds.midX, y: bounds.midY)
+    let targetDisplay =
+      displays.max { a, b in
+        let interA = a.intersection(bounds)
+        let interB = b.intersection(bounds)
+        let areaA = interA.isNull ? 0 : interA.width * interA.height
+        let areaB = interB.isNull ? 0 : interB.width * interB.height
+        if areaA != areaB { return areaA < areaB }
+        let distA = hypot(a.midX - winCenter.x, a.midY - winCenter.y)
+        let distB = hypot(b.midX - winCenter.x, b.midY - winCenter.y)
+        return distA > distB
+      } ?? displays[0]
+
+    let menuBarInset: CGFloat = 30
+    let maxX = max(targetDisplay.minX, targetDisplay.maxX - bounds.width)
+    let maxY = max(targetDisplay.minY + menuBarInset, targetDisplay.maxY - bounds.height)
+    let clampedX = min(max(bounds.origin.x, targetDisplay.minX), maxX)
+    let clampedY = min(max(bounds.origin.y, targetDisplay.minY + menuBarInset), maxY)
+    let newOrigin = CGPoint(x: clampedX, y: clampedY)
+
+    if let axWin = findBestAXWindow(pid: pid, expectedBounds: bounds, expectedTitle: title ?? "") {
+      var pos = newOrigin
+      if let posVal = AXValueCreate(.cgPoint, &pos) {
+        AXUIElementSetAttributeValue(axWin, kAXPositionAttribute as CFString, posVal)
+      }
+      AXUIElementPerformAction(axWin, kAXRaiseAction as CFString)
+      AXUIElementSetAttributeValue(axWin, kAXMainAttribute as CFString, kCFBooleanTrue)
+    }
+
+    cachedBoundsTarget = nil
+    cachedBoundsValue = nil
+    if let (refreshedBounds, _, _) = resolveBoundsAndPid(target, forceRefresh: true) {
+      return screenPoint(nx: nx, ny: ny, bounds: refreshedBounds)
+    }
+    return screenPoint(nx: nx, ny: ny, bounds: CGRect(origin: newOrigin, size: bounds.size))
+  }
+
+  private func findBestAXWindow(
+    pid: Int32,
+    expectedBounds: CGRect,
+    expectedTitle: String
+  ) -> AXUIElement? {
     let appElem = AXUIElementCreateApplication(pid)
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(appElem, kAXWindowsAttribute as CFString, &value) == .success,
       let windows = value as? [AXUIElement],
       !windows.isEmpty
     else {
-      return
+      return nil
     }
 
     var bestMatch: AXUIElement?
@@ -170,18 +216,75 @@ final class InputInjector {
       }
     }
 
-    if let targetWin = bestMatch {
+    return bestMatch
+  }
+
+  private func focusTarget(_ target: CaptureTargetKey, force: Bool) {
+    guard case .window(let windowId) = target else { return }
+    guard let (bounds, pidOpt, titleOpt) = resolveBoundsAndPid(target, forceRefresh: force),
+      let pid = pidOpt
+    else {
+      return
+    }
+    let now = CFAbsoluteTimeGetCurrent()
+    if !force {
+      if lastFocusPid == pid && lastFocusWindowId == windowId && (now - lastFocusTime) < 1.5 {
+        return
+      }
+      if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+        && lastFocusWindowId == windowId
+      {
+        lastFocusTime = now
+        return
+      }
+    }
+    lastFocusPid = pid
+    lastFocusWindowId = windowId
+    lastFocusTime = now
+
+    if let app = NSRunningApplication(processIdentifier: pid) {
+      app.activate()
+    }
+    raiseWindowViaAX(pid: pid, expectedBounds: bounds, expectedTitle: titleOpt ?? "")
+  }
+
+  private func raiseWindowViaAX(pid: Int32, expectedBounds: CGRect, expectedTitle: String) {
+    if let targetWin = findBestAXWindow(
+      pid: pid,
+      expectedBounds: expectedBounds,
+      expectedTitle: expectedTitle
+    ) {
       AXUIElementPerformAction(targetWin, kAXRaiseAction as CFString)
       AXUIElementSetAttributeValue(targetWin, kAXMainAttribute as CFString, kCFBooleanTrue)
     }
   }
 
+  private func roundedNonZero(_ value: Double) -> Int32 {
+    if abs(value) < 0.05 { return 0 }
+    let rounded = Int32(value.rounded())
+    if rounded != 0 { return rounded }
+    return value > 0 ? 1 : -1
+  }
+
   private func handleMouse(_ command: InputCommand, target: CaptureTargetKey) {
     guard let nx = command.x, let ny = command.y, let action = command.action else { return }
-    guard let (bounds, _, _) = resolveBoundsAndPid(target, forceRefresh: action == "down") else {
+    guard let (bounds, pid, title) = resolveBoundsAndPid(target, forceRefresh: action == "down")
+    else {
       return
     }
-    let pt = screenPoint(nx: nx, ny: ny, bounds: bounds)
+    let pt: CGPoint
+    if action == "down" {
+      pt = ensureTargetPointOnScreen(
+        target,
+        nx: nx,
+        ny: ny,
+        bounds: bounds,
+        pid: pid,
+        title: title
+      )
+    } else {
+      pt = screenPoint(nx: nx, ny: ny, bounds: bounds)
+    }
     let buttonName = command.button ?? "left"
     let flags = cgEventFlags(from: command.modifiers ?? 0)
 
@@ -253,11 +356,20 @@ final class InputInjector {
 
   private func handleWheel(_ command: InputCommand, target: CaptureTargetKey) {
     guard let nx = command.x, let ny = command.y else { return }
-    guard let (bounds, _, _) = resolveBoundsAndPid(target) else { return }
-    let pt = screenPoint(nx: nx, ny: ny, bounds: bounds)
+    guard let (bounds, pid, title) = resolveBoundsAndPid(target) else { return }
+    focusTarget(target, force: false)
+    let pt = ensureTargetPointOnScreen(
+      target,
+      nx: nx,
+      ny: ny,
+      bounds: bounds,
+      pid: pid,
+      title: title
+    )
     let flags = cgEventFlags(from: command.modifiers ?? 0)
 
-    // Move cursor over the scroll point so the right scrollable view receives the wheel event.
+    // Move cursor over the scroll point and stamp wheel.location so WindowServer hit-tests
+    // the exact target view instead of the default (0, screenHeight) origin.
     if let move = CGEvent(
       mouseEventSource: nil,
       mouseType: .mouseMoved,
@@ -267,8 +379,8 @@ final class InputInjector {
       move.post(tap: .cghidEventTap)
     }
 
-    let dy = Int32((-(command.deltaY ?? 0)).rounded())
-    let dx = Int32((-(command.deltaX ?? 0)).rounded())
+    let dy = roundedNonZero(-(command.deltaY ?? 0))
+    let dx = roundedNonZero(-(command.deltaX ?? 0))
     if dy == 0 && dx == 0 { return }
     guard
       let wheel = CGEvent(
@@ -282,6 +394,7 @@ final class InputInjector {
     else {
       return
     }
+    wheel.location = pt
     wheel.flags = flags
     wheel.post(tap: .cghidEventTap)
   }
